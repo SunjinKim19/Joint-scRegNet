@@ -85,6 +85,14 @@ def parse_args():
     parser.add_argument("--num_heads", type=int, default=3)
     parser.add_argument("--alpha", type=int, default=0.2)
 
+    #params for joint
+    parser.add_argument("--joint_latent_dim", type=int, default=128)
+    parser.add_argument("--cell_hidden_dim", type=int, default=256)
+    parser.add_argument("--link_hidden_dim", type=int, default=128)
+
+    parser.add_argument("--lambda_recon", type=float, default=0.1)
+    parser.add_argument("--lambda_align", type=float, default=0.01)
+
     args = parser.parse_args()
     return args
 

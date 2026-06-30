@@ -169,7 +169,7 @@ class Infer:
         train_data, test_data, adj, data_feature1, data_feature2 = self._prepare_data()
         self.model = self.get_model()
         model_path = os.path.join(self.args.output_dir, f"best/ckpt/model.pt")
-        self.model.load_state_dict(torch.load(model_path)) 
+        self.model.load_state_dict(torch.load(model_path, map_location='cpu')) 
         self.model.eval()
 
         results_train = []
@@ -209,7 +209,7 @@ def main(best_dir):
     return results_train, results_test
 
 if __name__ == "__main__":
-    best_dir = './out/GCN/Geneformer/tf_500_hESC/best/'
+    best_dir = './out/GCN/Geneformer/tf_500_hHEP/best/'
     _, results_test = main(best_dir)
 
     metric_keys = results_test[0].keys()
