@@ -11,13 +11,18 @@ def to_edge_index(adj):
     scRegNet의 adj는 torch sparse tensor 형태로 들어올 수 있으므로
     PyG GCNConv가 사용할 수 있는 edge_index 형태로 변환한다.
     """
-    if isinstance(adj, torch.Tensor) and adj.is_sparse:
+    if isinstance(adj, torch.Tensor) and adj.layout != torch.strided:
         return adj.coalesce().indices().long()
 
     if isinstance(adj, torch.Tensor) and adj.dim() == 2 and adj.size(0) == 2:
         return adj.long()
 
-    raise ValueError("adj must be either sparse adjacency tensor or edge_index tensor.")
+    if isinstance(adj, torch.Tensor) and adj.dim() == 2 and adj.size(0) == adj.size(1):
+        return adj.nonzero(as_tuple=False).T.contiguous().long()
+
+    raise ValueError(
+        "adj must be a square dense/sparse adjacency tensor or edge_index [2, E]."
+    )
 
 
 class CellExpressionEncoder(nn.Module):
@@ -106,11 +111,13 @@ class JointInferScRegNet(nn.Module):
         latent_dim=128,
         link_hidden_dim=128,
         dropout=0.2,
+        max_recon_cells=256,
     ):
         super().__init__()
 
         self.num_genes = num_genes
         self.latent_dim = latent_dim
+        self.max_recon_cells = max_recon_cells
 
         # Graph-M
         self.graph_encoder = GraphEncoderGCN(
@@ -189,6 +196,16 @@ class JointInferScRegNet(nn.Module):
                 = [num_cells, num_genes]
         """
         x_cell_gene = x_gene_expr.T
+        if (
+            self.training
+            and self.max_recon_cells is not None
+            and self.max_recon_cells > 0
+            and x_cell_gene.size(0) > self.max_recon_cells
+        ):
+            cell_indices = torch.randperm(
+                x_cell_gene.size(0), device=x_cell_gene.device
+            )[: self.max_recon_cells]
+            x_cell_gene = x_cell_gene[cell_indices]
         z_cell = self.cell_encoder(x_cell_gene)
         x_recon = torch.matmul(z_cell, z_gene.T)
 

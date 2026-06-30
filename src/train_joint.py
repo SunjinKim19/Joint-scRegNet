@@ -3,25 +3,60 @@
 import os
 import gc
 import logging
+import sys
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+if __package__ in (None, ""):
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Keep CLI discovery usable even when optional training dependencies are absent.
+if __name__ == "__main__" and any(arg in ("-h", "--help") for arg in sys.argv[1:]):
+    from src.args import parse_args as _parse_args
+
+    _parse_args()
+
 from src.train import Trainer as BaseTrainer
 from src.models_joint import JointInferScRegNet
 from src.utils import Evaluation, set_logging, set_seed
 from src.args import save_args, parse_args
+from src.device_utils import get_device
 
 logger = logging.getLogger(__name__)
 
+def to_binary_label(y):
+    """
+    scRegNet label이 [batch], [batch, 1], [batch, 2] 중 어떤 형태로 와도
+    BCEWithLogitsLoss에 맞는 [batch] binary label로 변환한다.
+
+    [batch, 2] one-hot label이면 positive class인 두 번째 column을 사용한다.
+    """
+    y = y.float()
+
+    if y.dim() == 2:
+        if y.size(1) == 2:
+            return y[:, 1].contiguous()
+        if y.size(1) == 1:
+            return y[:, 0].contiguous()
+
+    return y.view(-1).contiguous()
 
 class JointInferTrainer(BaseTrainer):
     """
     기존 scRegNet Trainer를 상속해서
     model과 training objective만 GeSubNet-style joint inference로 교체한다.
     """
+
+    def __init__(self, args, **kwargs):
+        super().__init__(args, **kwargs)
+        self._device = get_device(args.device)
+
+    @property
+    def device(self):
+        return self._device
 
     def get_model(self, data_feature1, data_feature2):
         num_genes = data_feature2.size(0)
@@ -33,21 +68,27 @@ class JointInferTrainer(BaseTrainer):
         cell_hidden_dim = getattr(self.args, "cell_hidden_dim", 256)
         link_hidden_dim = getattr(self.args, "link_hidden_dim", 128)
 
+        gnn_hidden_dims = getattr(self.args, "gnn_hidden_dims", None)
+        if gnn_hidden_dims is None:
+            gnn_hidden_dims = [self.args.gnn_dim_hidden] * self.args.gnn_num_layers
+
         model = JointInferScRegNet(
             num_genes=num_genes,
             expr_input_dim=expr_input_dim,
             scfm_dim=scfm_dim,
-            gnn_hidden_dims=self.args.gnn_hidden_dims,
+            gnn_hidden_dims=gnn_hidden_dims,
             cell_hidden_dim=cell_hidden_dim,
             latent_dim=latent_dim,
             link_hidden_dim=link_hidden_dim,
             dropout=self.args.dropout,
+            max_recon_cells=self.args.max_recon_cells,
         ).to(self.device)
 
         return model
 
     def train(self):
-        max_auc = 0.0
+        best_score = -1.0
+        best_auc = 0.0
         best_aupr = 0.0
         accumulate_patience = 0
 
@@ -64,8 +105,14 @@ class JointInferTrainer(BaseTrainer):
             weight_decay=self.args.gnn_weight_decay,
         )
 
-        lambda_recon = getattr(self.args, "lambda_recon", 0.1)
+        lambda_recon = getattr(self.args, "lambda_recon", 0.01)
         lambda_align = getattr(self.args, "lambda_align", 0.01)
+        link_criterion = torch.nn.BCEWithLogitsLoss()
+        recon_criterion = torch.nn.MSELoss()
+
+        train_loader = DataLoader(
+            train_load, batch_size=self.args.batch_size, shuffle=True
+        )
 
         for epoch in tqdm(range(self.args.gnn_epochs)):
             self.model.train()
@@ -74,15 +121,11 @@ class JointInferTrainer(BaseTrainer):
             running_recon_loss = 0.0
             running_align_loss = 0.0
 
-            for train_x, train_y in DataLoader(
-                train_load,
-                batch_size=self.args.batch_size,
-                shuffle=True,
-            ):
+            for train_x, train_y in train_loader:
                 optimizer.zero_grad()
 
                 train_x = train_x.to(self.device)
-                train_y = train_y.to(self.device).float().view(-1)
+                train_y = to_binary_label(train_y.to(self.device))
 
                 logits, aux = self.model(
                     x_gene_expr=data_feature2,
@@ -91,16 +134,18 @@ class JointInferTrainer(BaseTrainer):
                     scfm_emb=data_feature1,
                 )
 
+                if logits.shape != train_y.shape:
+                    raise RuntimeError(
+                        f"Shape mismatch: logits={logits.shape}, train_y={train_y.shape}"
+                    )
+
                 # 1. 기존 scRegNet의 link prediction loss
-                link_loss = F.binary_cross_entropy_with_logits(
-                    logits,
-                    train_y,
-                )
+                link_loss = link_criterion(logits, train_y)
 
                 # 2. GeSubNet Infer-M 스타일 reconstruction loss
                 # x_recon:  [num_cells, num_genes]
                 # x_target: [num_cells, num_genes]
-                recon_loss = F.mse_loss(
+                recon_loss = recon_criterion(
                     aux["x_recon"],
                     aux["x_target"],
                 )
@@ -135,7 +180,7 @@ class JointInferTrainer(BaseTrainer):
 
                 with torch.no_grad():
                     test_pairs = test_data[:, :2]
-                    test_labels = test_data[:, -1]
+                    test_labels = to_binary_label(test_data[:, 2:].to(self.device))
 
                     test_logits, _ = self.model(
                         x_gene_expr=data_feature2,
@@ -152,10 +197,11 @@ class JointInferTrainer(BaseTrainer):
                         flag=False,
                     )
 
-                avg_loss = running_loss / max(1, len(train_load))
-                avg_link = running_link_loss / max(1, len(train_load))
-                avg_recon = running_recon_loss / max(1, len(train_load))
-                avg_align = running_align_loss / max(1, len(train_load))
+                num_batches = max(1, len(train_loader))
+                avg_loss = running_loss / num_batches
+                avg_link = running_link_loss / num_batches
+                avg_recon = running_recon_loss / num_batches
+                avg_align = running_align_loss / num_batches
 
                 logger.info(
                     f"Epoch {epoch + 1:03d} | "
@@ -166,9 +212,18 @@ class JointInferTrainer(BaseTrainer):
                     f"AUROC={auc:.4f} | AUPRC={aupr:.4f}"
                 )
 
-                if auc > max_auc:
+                # early stopping 기준 선택
+                if self.args.early_stop_metric == "auprc":
+                    current_score = aupr
+                else:
+                    current_score = auc
+
+                improved = current_score > best_score + self.args.min_delta
+
+                if improved:
                     accumulate_patience = 0
-                    max_auc = auc
+                    best_score = current_score
+                    best_auc = auc
                     best_aupr = aupr
 
                     self.args.ckpt_name = os.path.join(
@@ -176,26 +231,44 @@ class JointInferTrainer(BaseTrainer):
                         f"joint_model_seed{self.args.random_seed}.pt",
                     )
 
-                    torch.save(
-                        self.model.state_dict(),
-                        self.args.ckpt_name,
-                    )
-
+                    os.makedirs(self.args.ckpt_dir, exist_ok=True)
+                    torch.save(self.model.state_dict(), self.args.ckpt_name)
                     save_args(self.args, self.args.ckpt_dir)
 
+                    logger.info(
+                        f"New best model saved | "
+                        f"metric={self.args.early_stop_metric} | "
+                        f"score={best_score:.4f} | "
+                        f"AUROC={best_auc:.4f} | AUPRC={best_aupr:.4f}"
+                    )
                 else:
                     accumulate_patience += 1
+                    logger.info(
+                        f"No improvement | "
+                        f"patience={accumulate_patience}/{self.args.patience} | "
+                        f"best_{self.args.early_stop_metric}={best_score:.4f}"
+                    )
 
-                if accumulate_patience >= 10:
+                if accumulate_patience >= self.args.patience:
+                    logger.info(
+                        f"Early stopping triggered at epoch {epoch + 1}. "
+                        f"Best AUROC={best_auc:.4f}, Best AUPRC={best_aupr:.4f}"
+                    )
                     break
 
-        logger.info(f"best_auroc: {max_auc:.4f}, best_auprc: {best_aupr:.4f}")
-        return max_auc, best_aupr
+        logger.info(f"best_auroc: {best_auc:.4f}, best_auprc: {best_aupr:.4f}")
+        return best_auc, best_aupr
 
 
 def main():
     set_logging()
     args = parse_args()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(args.ckpt_dir, exist_ok=True)
+
+    device = get_device(args.device)
+    args.device = str(device)
 
     logger.critical(
         f"Training JointInfer-scRegNet on {args.dataset}, "
@@ -206,10 +279,6 @@ def main():
 
     trainer = JointInferTrainer(args)
     auroc, auprc = trainer.train()
-
-    del trainer
-    torch.cuda.empty_cache()
-    gc.collect()
 
     return auroc, auprc
 

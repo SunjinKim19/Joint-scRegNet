@@ -16,6 +16,9 @@ def parse_args():
     parser.add_argument("--local_rank", type=int)
     parser.add_argument("--suffix", type=str, default="main")
     parser.add_argument("--deepspeed", type=str, default=None)
+    parser.add_argument(
+        "--device", choices=["auto", "cuda", "cpu"], default="auto"
+    )
 
     # parameters for data and model storage
     parser.add_argument("--data_folder", type=str, default="./data")
@@ -90,8 +93,18 @@ def parse_args():
     parser.add_argument("--cell_hidden_dim", type=int, default=256)
     parser.add_argument("--link_hidden_dim", type=int, default=128)
 
-    parser.add_argument("--lambda_recon", type=float, default=0.1)
+    parser.add_argument("--lambda_recon", type=float, default=0.005)
     parser.add_argument("--lambda_align", type=float, default=0.01)
+    parser.add_argument("--max_recon_cells", type=int, default=256)
+
+    parser.add_argument("--patience", type=int, default=3)
+    parser.add_argument(
+        "--early_stop_metric",
+        type=str,
+        default="auprc",
+        choices=["auprc", "auroc"],
+    )
+    parser.add_argument("--min_delta", type=float, default=0.0)
 
     args = parser.parse_args()
     return args
