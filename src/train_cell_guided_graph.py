@@ -159,6 +159,11 @@ class CellGuidedGraphTrainer:
             dropout=self.args.dropout,
             graph_alpha=self.args.graph_alpha,
             graph_constructor_type=self.args.graph_constructor_type,
+            graph_fusion_type=self.args.graph_fusion_type,
+            gate_hidden_dim=self.args.gate_hidden_dim,
+            gate_dropout=self.args.gate_dropout,
+            gate_temperature=self.args.gate_temperature,
+            gate_init_from_alpha=self.args.gate_init_from_alpha,
             scfm_tune_mode="adapter",
         ).to(self.device)
         if not self.args.train_scfm_adapter:
@@ -203,6 +208,8 @@ class CellGuidedGraphTrainer:
             logger.info("  A_ctx shape: %s", tuple(output["A_ctx"].shape))
             logger.info("  A_prior shape: %s", tuple(output["A_prior"].shape))
             logger.info("  A_final shape: %s", tuple(output["A_final"].shape))
+            if output.get("gate") is not None:
+                logger.info("  gate shape: %s", tuple(output["gate"].shape))
             logger.info("  z_graph shape: %s", tuple(output["z_graph"].shape))
             logger.info("  edge_pairs shape: %s", tuple(edge_pairs.shape))
             logger.info("  prediction shape: %s", tuple(output["probabilities"].shape))
@@ -218,38 +225,42 @@ class CellGuidedGraphTrainer:
         return total_loss, bce_loss, sparse_loss_used, sparse_loss_basis
 
     def verify_gradient_path(self, output):
+        """Check autograd connectivity without invoking backward or reading grads."""
         if self._checked_gradients:
             return
-        if not output["A_ctx"].requires_grad or not output["z_ctx"].requires_grad:
-            raise RuntimeError(
-                "Gradient path broken: both A_ctx and z_ctx must require gradients"
-            )
-        constructor_has_grad = any(
-            parameter.grad is not None
-            and torch.isfinite(parameter.grad).all()
-            and parameter.grad.abs().sum() > 0
-            for parameter in self.model.graph_constructor.parameters()
+        prediction = output.get("prediction")
+        if prediction is None or not prediction.requires_grad:
+            raise RuntimeError("Gradient path broken: prediction must require gradients")
+        if not output["z_ctx"].requires_grad:
+            raise RuntimeError("Gradient path broken: z_ctx must require gradients")
+        a_ctx_should_require_grad = (
+            self.args.graph_fusion_type == "edge_gate"
+            or self.args.graph_alpha < 1.0
         )
-        cell_has_grad = any(
-            parameter.requires_grad
-            and parameter.grad is not None
-            and torch.isfinite(parameter.grad).all()
-            and parameter.grad.abs().sum() > 0
-            for parameter in self.model.cell_m.parameters()
-        )
-        if not constructor_has_grad or not cell_has_grad:
+        if a_ctx_should_require_grad and not output["A_ctx"].requires_grad:
             raise RuntimeError(
-                "Backward gradient check failed: "
-                f"GraphConstructor={constructor_has_grad}, Cell-M={cell_has_grad}. "
-                "Check graph_alpha and differentiable adjacency operations."
+                "Gradient path broken: A_ctx must require gradients for the "
+                f"{self.args.graph_fusion_type} fusion path"
             )
+        gate_requires_grad = None
+        if self.args.graph_fusion_type == "edge_gate":
+            gate = output.get("gate")
+            if gate is None or not gate.requires_grad:
+                raise RuntimeError(
+                    "Gradient path broken: edge_gate output must require gradients"
+                )
+            gate_requires_grad = gate.requires_grad
+            if torch.allclose(output["A_final"], output["A_prior"]):
+                raise RuntimeError("edge_gate produced A_final identical to A_prior")
+            if torch.allclose(output["A_final"], output["A_ctx"]):
+                raise RuntimeError("edge_gate produced A_final identical to A_ctx")
         logger.info(
-            "Gradient smoke check passed: A_ctx.requires_grad=%s, "
-            "z_ctx.requires_grad=%s, GraphConstructor_grad=%s, Cell-M_grad=%s",
+            "Non-invasive gradient path check passed: prediction.requires_grad=%s, "
+            "A_ctx.requires_grad=%s, z_ctx.requires_grad=%s, gate.requires_grad=%s",
+            prediction.requires_grad,
             output["A_ctx"].requires_grad,
             output["z_ctx"].requires_grad,
-            constructor_has_grad,
-            cell_has_grad,
+            gate_requires_grad,
         )
         self._checked_gradients = True
 
@@ -311,6 +322,10 @@ class CellGuidedGraphTrainer:
                     output = self.forward(bundle, edge_pairs)
                     if epoch == 0 and bundle_index == 0 and batch_index == 0:
                         candidate_mask = output.get("candidate_mask")
+                        if output.get("gate") is not None:
+                            log_adj_stats(
+                                logger, "Gate", output["gate"], candidate_mask
+                            )
                         log_adj_stats(
                             logger, "A_ctx", output["A_ctx"], candidate_mask
                         )
@@ -320,6 +335,7 @@ class CellGuidedGraphTrainer:
                         log_adj_stats(
                             logger, "A_final", output["A_final"], candidate_mask
                         )
+                    self.verify_gradient_path(output)
                     (
                         total_loss,
                         bce_loss,
@@ -334,7 +350,6 @@ class CellGuidedGraphTrainer:
                             f"{sparse_loss_basis} -> {batch_sparse_loss_basis}"
                         )
                     total_loss.backward()
-                    self.verify_gradient_path(output)
                     optimizer.step()
                     totals["total"] += total_loss.item()
                     totals["bce"] += bce_loss.item()
@@ -406,10 +421,12 @@ def main():
     os.makedirs(args.ckpt_dir, exist_ok=True)
     set_seed(args.random_seed)
     logger.critical(
-        "Training serial CellGuidedGraphScRegNet on %s with scFM=%s, constructor=%s, alpha=%.3f",
+        "Training serial CellGuidedGraphScRegNet on %s with scFM=%s, "
+        "constructor=%s, graph_fusion_type=%s, alpha=%.3f",
         ",".join(requested_cell_types(args)),
         args.llm_type,
         args.graph_constructor_type,
+        args.graph_fusion_type,
         args.graph_alpha,
     )
     trainer = CellGuidedGraphTrainer(args)

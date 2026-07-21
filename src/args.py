@@ -7,6 +7,18 @@ logger = logging.getLogger(__name__)
 
 GNN_LIST = ["GraphSAGE", "GCN", "GAT"]
 
+
+def str2bool(value):
+    """Parse explicit true/false CLI values without argparse's bool pitfall."""
+    if isinstance(value, bool):
+        return value
+    value = value.lower()
+    if value in ("true", "1", "yes", "y"):
+        return True
+    if value in ("false", "0", "no", "n"):
+        return False
+    raise argparse.ArgumentTypeError("expected one of: true, false, 1, 0, yes, no")
+
 def parse_args():
     parser = argparse.ArgumentParser()
     # environment
@@ -97,14 +109,110 @@ def parse_args():
     parser.add_argument("--lambda_align", type=float, default=0.01)
     parser.add_argument("--max_recon_cells", type=int, default=256)
 
-    parser.add_argument("--patience", type=int, default=3)
+    # cross-model attention fusion
+    parser.add_argument(
+        "--fusion_mode",
+        type=str,
+        default="gnn_to_scfm",
+        choices=["gated", "gnn_to_scfm", "bidirectional"],
+    )
+    parser.add_argument("--fusion_layers", type=int, default=1)
+    parser.add_argument("--fusion_heads", type=int, default=4)
+    parser.add_argument("--fusion_dropout", type=float, default=0.2)
+    parser.add_argument("--cross_latent_dim", type=int, default=128)
+    parser.add_argument("--directed_link_predictor", type=int, default=1)
+    parser.add_argument(
+        "--loss_type",
+        type=str,
+        default="bce",
+        choices=["bce", "pos_weight_bce", "focal"],
+    )
+    parser.add_argument("--focal_alpha", type=float, default=0.75)
+    parser.add_argument("--focal_gamma", type=float, default=2.0)
     parser.add_argument(
         "--early_stop_metric",
         type=str,
         default="auprc",
         choices=["auprc", "auroc"],
     )
+    parser.add_argument("--patience", type=int, default=5)
     parser.add_argument("--min_delta", type=float, default=0.0)
+
+    # GeSubNet-inspired Cell/Condition-M + Graph-M + Infer-M path
+    parser.add_argument(
+        "--cell_types",
+        type=str,
+        default="",
+        help="Comma-separated cell types for multi-condition training.",
+    )
+    parser.add_argument("--condition_joint_latent_dim", type=int, default=128)
+    parser.add_argument("--condition_hidden_dim", type=int, default=256)
+    parser.add_argument(
+        "--context_recon_target",
+        type=str,
+        default="projected_scfm",
+        choices=["none", "scfm", "projected_scfm"],
+    )
+    parser.add_argument("--lambda_context", type=float, default=0.001)
+    parser.add_argument("--lambda_condition", type=float, default=0.0)
+    parser.add_argument("--lambda_graph_pre", type=float, default=0.0)
+    parser.add_argument(
+        "--infer_fusion_mode",
+        type=str,
+        default="bidirectional",
+        choices=["gated", "bidirectional"],
+    )
+    parser.add_argument("--infer_layers", type=int, default=1)
+    parser.add_argument("--infer_heads", type=int, default=4)
+    parser.add_argument("--infer_dropout", type=float, default=0.2)
+    parser.add_argument(
+        "--scfm_tune_mode",
+        type=str,
+        default="adapter",
+        choices=["frozen_embedding", "adapter", "top", "full"],
+    )
+
+    # Serial Cell-M -> graph construction -> Graph-M path.
+    parser.add_argument("--use_cell_guided_graph", type=str2bool, default=True)
+    parser.add_argument("--graph_alpha", type=float, default=0.8)
+    parser.add_argument(
+        "--graph_fusion_type",
+        type=str,
+        default="fixed",
+        choices=["fixed", "edge_gate"],
+    )
+    parser.add_argument("--gate_hidden_dim", type=int, default=32)
+    parser.add_argument("--gate_dropout", type=float, default=0.0)
+    parser.add_argument("--gate_temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--gate_init_from_alpha",
+        dest="gate_init_from_alpha",
+        action="store_true",
+        default=True,
+    )
+    parser.add_argument(
+        "--no_gate_init_from_alpha",
+        dest="gate_init_from_alpha",
+        action="store_false",
+        help="Use the gate module's default random initialization.",
+    )
+    parser.add_argument("--lambda_sparse", type=float, default=0.0)
+    parser.add_argument(
+        "--graph_constructor_type",
+        type=str,
+        default="mlp",
+        choices=["mlp", "bilinear"],
+    )
+    parser.add_argument("--latent_dim", type=int, default=128)
+    parser.add_argument(
+        "--hard_topk_eval_only",
+        type=int,
+        default=0,
+        help="Optional outgoing edges per TF for evaluation/visualization only; 0 disables it.",
+    )
+    parser.add_argument("--freeze_scfm", type=str2bool, default=True)
+    parser.add_argument("--train_scfm_adapter", type=str2bool, default=True)
+    parser.add_argument("--train_scfm_top_layers", type=int, default=0)
 
     args = parser.parse_args()
     return args

@@ -1,5 +1,6 @@
 """Serial Cell-M -> soft graph construction -> Graph-M link predictor."""
 
+import math
 import warnings
 
 import torch
@@ -208,6 +209,57 @@ class WeightedGraphM(nn.Module):
         return self.output_norm(self.output_projector(x))
 
 
+class EdgeWiseGraphGate(nn.Module):
+    """Learn a differentiable prior/context mixture for every directed edge.
+
+    A fixed scalar applies the same mixture to every TF-target pair. This gate
+    instead uses node compatibility and both adjacency values to decide which
+    source should be trusted for each edge, without materializing [N, N, 2d].
+    """
+
+    def __init__(
+        self,
+        latent_dim,
+        hidden_dim=32,
+        dropout=0.0,
+        temperature=1.0,
+        initial_alpha=0.8,
+        init_from_alpha=True,
+    ):
+        super().__init__()
+        if hidden_dim <= 0:
+            raise ValueError(f"gate hidden_dim must be positive, got {hidden_dim}")
+        if temperature <= 0:
+            raise ValueError(f"gate temperature must be positive, got {temperature}")
+        self.temperature = float(temperature)
+        self.query = nn.Linear(latent_dim, hidden_dim)
+        self.key = nn.Linear(latent_dim, hidden_dim)
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(3, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+        if init_from_alpha:
+            alpha = min(max(float(initial_alpha), 1e-4), 1.0 - 1e-4)
+            final_layer = self.gate_mlp[-1]
+            nn.init.zeros_(final_layer.weight)
+            nn.init.constant_(final_layer.bias, math.log(alpha / (1.0 - alpha)))
+
+    def forward(self, z_ctx, a_prior, a_ctx):
+        if a_prior.shape != a_ctx.shape:
+            raise ValueError(
+                "Edge gate requires matching A_prior and A_ctx shapes, got "
+                f"{tuple(a_prior.shape)} and {tuple(a_ctx.shape)}"
+            )
+        q = self.query(z_ctx)
+        k = self.key(z_ctx)
+        pair_score = (q @ k.t()) / math.sqrt(q.size(-1))
+        gate_features = torch.stack((a_prior, a_ctx, pair_score), dim=-1)
+        gate_logits = self.gate_mlp(gate_features).squeeze(-1)
+        return torch.sigmoid(gate_logits / self.temperature)
+
+
 class CellGuidedGraphScRegNet(nn.Module):
     """End-to-end serial model with no Infer-M or z_joint fusion path."""
 
@@ -222,12 +274,20 @@ class CellGuidedGraphScRegNet(nn.Module):
         dropout=0.2,
         graph_alpha=0.8,
         graph_constructor_type="mlp",
+        graph_fusion_type="fixed",
+        gate_hidden_dim=32,
+        gate_dropout=0.0,
+        gate_temperature=1.0,
+        gate_init_from_alpha=True,
         scfm_tune_mode="adapter",
     ):
         super().__init__()
         if not 0.0 <= graph_alpha <= 1.0:
             raise ValueError(f"graph_alpha must be in [0, 1], got {graph_alpha}")
+        if graph_fusion_type not in ("fixed", "edge_gate"):
+            raise ValueError("graph_fusion_type must be 'fixed' or 'edge_gate'")
         self.num_genes = num_genes
+        self.graph_fusion_type = graph_fusion_type
         # Kept as a buffer so a future implementation can replace it with a gate.
         self.register_buffer("graph_alpha", torch.tensor(float(graph_alpha)))
         self.cell_m = CellM(
@@ -245,6 +305,18 @@ class CellGuidedGraphScRegNet(nn.Module):
         )
         self.graph_m = WeightedGraphM(latent_dim, gnn_hidden_dims, dropout)
         self.decoder = DirectedDecoder(latent_dim, link_hidden_dim, dropout)
+        self.edge_gate = (
+            EdgeWiseGraphGate(
+                latent_dim=latent_dim,
+                hidden_dim=gate_hidden_dim,
+                dropout=gate_dropout,
+                temperature=gate_temperature,
+                initial_alpha=graph_alpha,
+                init_from_alpha=gate_init_from_alpha,
+            )
+            if graph_fusion_type == "edge_gate"
+            else None
+        )
 
     def forward(
         self,
@@ -294,13 +366,22 @@ class CellGuidedGraphScRegNet(nn.Module):
         a_prior = adjacency_to_dense(
             prior_adjacency, self.num_genes, z_ctx.device, z_ctx.dtype
         )
-        a_final = self.graph_alpha * a_prior + (1.0 - self.graph_alpha) * a_ctx_for_graph
+        gate = None
+        if self.graph_fusion_type == "fixed":
+            a_final = (
+                self.graph_alpha * a_prior
+                + (1.0 - self.graph_alpha) * a_ctx_for_graph
+            )
+        else:
+            gate = self.edge_gate(z_ctx, a_prior, a_ctx_for_graph)
+            a_final = gate * a_prior + (1.0 - gate) * a_ctx_for_graph
         z_graph = self.graph_m(node_features=z_ctx, adjacency=a_final)
         logits = self.decoder(z_graph, edge_pairs)
         pred = torch.sigmoid(logits)
-        return {
+        output = {
             "logits": logits,
             "pred": pred,
+            "prediction": pred,
             "probabilities": pred,
             "z_ctx": z_ctx,
             "A_ctx": a_ctx,
@@ -310,3 +391,17 @@ class CellGuidedGraphScRegNet(nn.Module):
             "z_cell": cell_output["z_cell"],
             "candidate_mask": candidate_mask,
         }
+        if gate is not None:
+            output["gate"] = gate
+            with torch.no_grad():
+                offdiag_mask = torch.ones_like(gate, dtype=torch.bool)
+                offdiag_mask.fill_diagonal_(False)
+                output["gate_mean_all_offdiag"] = gate[offdiag_mask].mean()
+                candidate_offdiag = candidate_mask & offdiag_mask
+                output["gate_mean_candidate"] = gate[candidate_offdiag].mean()
+                output["gate_min_all_offdiag"] = gate[offdiag_mask].min()
+                output["gate_max_all_offdiag"] = gate[offdiag_mask].max()
+                output["gate_density_all_offdiag@0.5"] = (
+                    (gate[offdiag_mask] > 0.5).float().mean()
+                )
+        return output
