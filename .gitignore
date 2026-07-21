@@ -32,3 +32,9 @@ wandb/
 *.npy
 *.csv
 optuna.db
+# experiment outputs
+out/
+*.log
+__pycache__/
+*.pyc
+.DS_Store
