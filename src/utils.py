@@ -5,11 +5,16 @@ import scipy.sparse as sp
 import numpy as np
 from sklearn.metrics import roc_auc_score,average_precision_score
 import logging
-import colorlog
 import os
 import json
 import random
 import sys
+
+try:
+    import colorlog
+except ImportError:
+    colorlog = None
+
 
 def set_seed(random_seed):
     torch.backends.cudnn.deterministic = True
@@ -101,7 +106,8 @@ class load_data():
 
 def adj2saprse_tensor(adj):
     coo = adj.tocoo()
-    i = torch.LongTensor([coo.row, coo.col])
+    idx = np.vstack((coo.row, coo.col))
+    i = torch.from_numpy(idx).long()
     v = torch.from_numpy(coo.data).float()
     adj_sp_tensor = torch.sparse_coo_tensor(i, v, coo.shape)
     return adj_sp_tensor
@@ -153,7 +159,10 @@ def set_logging():
     color_format = "%(log_color)s" + log_format
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(colorlog.ColoredFormatter(color_format))
+    if colorlog is not None:
+        console_handler.setFormatter(colorlog.ColoredFormatter(color_format))
+    else:
+        console_handler.setFormatter(logging.Formatter(log_format))
     console_handler.addFilter(RankFilter())
     root.addHandler(console_handler)
 

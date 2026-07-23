@@ -223,9 +223,15 @@ def load_condition_bundle(args, cell_type, condition_id, device):
 
     loader = load_data(data_input)
     feature2 = torch.from_numpy(loader.exp_data()).float()
-    feature1 = _get_embeddings(args, cell_type, data_input)
-    if args.llm_type == "scBERT":
-        feature1 = feature1[:-1]
+    scfm_mode = getattr(args, "scfm_mode", "precomputed")
+    if scfm_mode == "precomputed":
+        feature1 = _get_embeddings(args, cell_type, data_input)
+        if args.llm_type == "scBERT":
+            feature1 = feature1[:-1]
+    else:
+        # Online scFM modes obtain their feature tensor from ScFMEncoder inside
+        # the training loop and must not depend on a precomputed CSV.
+        feature1 = torch.empty((feature2.size(0), 0), dtype=torch.float32)
 
     if feature1.size(0) != feature2.size(0):
         raise ValueError(

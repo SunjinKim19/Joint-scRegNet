@@ -23,6 +23,7 @@ from tqdm import tqdm
 
 from src.args import parse_args, save_args
 from src.device_utils import get_device
+from src.scfm_encoder import ScFMEncoder
 from src.train_condition_joint import (
     focal_bce_with_logits,
     prepare_condition_bundles,
@@ -115,13 +116,84 @@ def log_adj_stats(logger, name, A, candidate_mask=None):
         log_region(f"{name}_candidate", candidate_offdiag)
 
 
+def _has_nonzero_finite_gradient(parameters):
+    return any(
+        parameter.grad is not None
+        and torch.isfinite(parameter.grad).all()
+        and parameter.grad.abs().sum().item() > 0
+        for parameter in parameters
+    )
+
+
+def check_trainable_gradients_after_backward(model, args, scfm_encoder=None):
+    """Verify the normal training backward reached the intended parameters."""
+    downstream_parameters = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
+    if not _has_nonzero_finite_gradient(downstream_parameters):
+        raise RuntimeError("No non-zero gradient reached downstream model parameters")
+
+    if args.scfm_mode == "precomputed":
+        if scfm_encoder is not None and scfm_encoder.backbone_loaded:
+            raise RuntimeError("precomputed mode unexpectedly loaded an scFM backbone")
+        adapter_parameters = [
+            parameter
+            for parameter in model.cell_m.scfm_adapter.parameters()
+            if parameter.requires_grad
+        ]
+        if adapter_parameters and not _has_nonzero_finite_gradient(adapter_parameters):
+            raise RuntimeError("No non-zero gradient reached the Cell-M adapter")
+        logger.info(
+            "Post-backward gradient check passed: scfm_mode=precomputed, "
+            "scFM_backbone_loaded=False, Cell-M_adapter_trainable=%s, "
+            "Cell-M_adapter_grad=%s, downstream_grad=True",
+            bool(adapter_parameters),
+            _has_nonzero_finite_gradient(adapter_parameters)
+            if adapter_parameters
+            else None,
+        )
+        return
+
+    if scfm_encoder is None or not scfm_encoder.backbone_loaded:
+        raise RuntimeError(f"scfm_mode={args.scfm_mode} has no loaded scFM backbone")
+    scfm_trainable = [
+        parameter
+        for parameter in scfm_encoder.parameters()
+        if parameter.requires_grad
+    ]
+    if args.scfm_mode == "online_frozen":
+        if scfm_trainable:
+            raise RuntimeError("online_frozen has trainable scFM parameters")
+        logger.info(
+            "Post-backward gradient check passed: scfm_mode=online_frozen, "
+            "scFM_trainable_parameters=0, downstream_grad=True"
+        )
+        return
+    if not scfm_trainable:
+        raise RuntimeError(
+            f"scfm_mode={args.scfm_mode} created zero trainable scFM parameters"
+        )
+    if not _has_nonzero_finite_gradient(scfm_trainable):
+        raise RuntimeError(
+            f"True fine-tuning check failed: no non-zero gradient reached "
+            f"{args.scfm_mode} scFM parameters. Ensure scFM outputs are not detached."
+        )
+    logger.info(
+        "Post-backward gradient check passed: scfm_mode=%s, "
+        "scFM_trainable_grad=True, downstream_grad=True",
+        args.scfm_mode,
+    )
+
+
 class CellGuidedGraphTrainer:
     def __init__(self, args):
         self.args = args
         self.device = get_device(args.device)
         self.model = None
+        self.scfm_encoder = None
         self._logged_forward_shapes = False
         self._checked_gradients = False
+        self._checked_post_backward_gradients = False
 
     def get_model(self, bundles):
         from src.models_cell_guided_graph import CellGuidedGraphScRegNet
@@ -137,21 +209,30 @@ class CellGuidedGraphTrainer:
                 "--gnn_type %s is treated as GCN.",
                 self.args.gnn_type,
             )
-        if self.args.train_scfm_top_layers > 0:
+        if (
+            self.args.scfm_mode == "precomputed"
+            and self.args.train_scfm_top_layers > 0
+        ):
             logger.warning(
                 "Precomputed scFM embeddings do not expose transformer layers; "
                 "--train_scfm_top_layers is retained for CLI compatibility but cannot be applied."
             )
-        if not self.args.freeze_scfm:
+        if self.args.scfm_mode == "precomputed" and not self.args.freeze_scfm:
             logger.warning(
                 "--freeze_scfm false cannot unfreeze a precomputed embedding tensor; "
                 "the Cell-M adapter remains the trainable scFM-facing component."
             )
         ref = bundles[0]
+        num_genes = ref.data_feature2.size(0)
+        if self.args.scfm_mode == "precomputed":
+            scfm_dim = ref.data_feature1.size(1)
+            self.scfm_encoder.output_dim = scfm_dim
+        else:
+            scfm_dim = self.scfm_encoder.output_dim
         hidden_dims = [self.args.gnn_dim_hidden] * self.args.gnn_num_layers
         model = CellGuidedGraphScRegNet(
-            num_genes=ref.data_feature1.size(0),
-            scfm_dim=ref.data_feature1.size(1),
+            num_genes=num_genes,
+            scfm_dim=scfm_dim,
             latent_dim=self.args.latent_dim,
             condition_hidden_dim=self.args.condition_hidden_dim,
             gnn_hidden_dims=hidden_dims,
@@ -165,15 +246,69 @@ class CellGuidedGraphTrainer:
             gate_temperature=self.args.gate_temperature,
             gate_init_from_alpha=self.args.gate_init_from_alpha,
             scfm_tune_mode="adapter",
+            detach_scfm_input=self.args.scfm_mode
+            not in ("online_lora", "online_topk"),
         ).to(self.device)
         if not self.args.train_scfm_adapter:
             for parameter in model.cell_m.scfm_adapter.parameters():
                 parameter.requires_grad_(False)
-        logger.info(
-            "scFM embeddings are precomputed/frozen=True; Cell-M adapter trainable=%s",
-            self.args.train_scfm_adapter,
-        )
+        if self.args.scfm_mode == "precomputed":
+            logger.info(
+                "scFM embeddings are precomputed/frozen=True; "
+                "Cell-M adapter trainable=%s",
+                self.args.train_scfm_adapter,
+            )
         return model
+
+    def build_optimizer(self):
+        downstream_parameters = [
+            parameter for parameter in self.model.parameters() if parameter.requires_grad
+        ]
+        if not downstream_parameters:
+            raise RuntimeError("No trainable downstream parameters were found")
+        parameter_groups = [
+            {
+                "params": downstream_parameters,
+                "lr": self.args.downstream_lr,
+                "weight_decay": self.args.downstream_weight_decay,
+            }
+        ]
+        logger.info(
+            "Optimizer group downstream: parameters=%d lr=%.6g weight_decay=%.6g",
+            sum(parameter.numel() for parameter in downstream_parameters),
+            self.args.downstream_lr,
+            self.args.downstream_weight_decay,
+        )
+        scfm_parameters = [
+            parameter
+            for parameter in self.scfm_encoder.parameters()
+            if parameter.requires_grad
+        ]
+        if self.args.scfm_mode in ("online_lora", "online_topk"):
+            if not scfm_parameters:
+                raise RuntimeError(
+                    f"scfm_mode={self.args.scfm_mode} has zero trainable scFM "
+                    "parameters; refusing to claim fine-tuning."
+                )
+            parameter_groups.append(
+                {
+                    "params": scfm_parameters,
+                    "lr": self.args.scfm_lr,
+                    "weight_decay": self.args.scfm_weight_decay,
+                }
+            )
+            logger.info(
+                "Optimizer group scFM: parameters=%d lr=%.6g weight_decay=%.6g",
+                sum(parameter.numel() for parameter in scfm_parameters),
+                self.args.scfm_lr,
+                self.args.scfm_weight_decay,
+            )
+        elif scfm_parameters:
+            raise RuntimeError(
+                f"scfm_mode={self.args.scfm_mode} unexpectedly has trainable "
+                "backbone parameters"
+            )
+        return getattr(optim, self.args.optimizer_name)(parameter_groups)
 
     def link_loss(self, logits, targets, pos_weight):
         if self.args.loss_type == "bce":
@@ -187,8 +322,25 @@ class CellGuidedGraphTrainer:
         )
 
     def forward(self, bundle, edge_pairs, evaluation=False):
+        scfm_gene_embeddings = self.scfm_encoder(
+            {
+                "precomputed_embeddings": bundle.data_feature1,
+                "num_genes": bundle.data_feature2.size(0),
+                "cell_type": bundle.cell_type,
+            }
+        )
+        if scfm_gene_embeddings.dim() != 2:
+            raise ValueError(
+                "ScFMEncoder must return [num_genes, scfm_dim], got "
+                f"{tuple(scfm_gene_embeddings.shape)}"
+            )
+        if scfm_gene_embeddings.size(0) != bundle.data_feature2.size(0):
+            raise ValueError(
+                "Online scFM gene count does not match the downstream graph: "
+                f"{scfm_gene_embeddings.size(0)} vs {bundle.data_feature2.size(0)}"
+            )
         output = self.model(
-            scfm_gene_emb=bundle.data_feature1,
+            scfm_gene_emb=scfm_gene_embeddings,
             prior_adjacency=bundle.adj,
             edge_pairs=edge_pairs,
             raw_expr=bundle.raw_expr,
@@ -201,8 +353,14 @@ class CellGuidedGraphTrainer:
             logger.info("Cell-guided graph forward shape summary")
             logger.info("  raw expression shape: %s", tuple(bundle.raw_expr.shape))
             logger.info(
-                "  scFM embedding / Cell-M input shape: %s",
-                tuple(bundle.data_feature1.shape),
+                "  scFM output shape: %s", tuple(scfm_gene_embeddings.shape)
+            )
+            logger.info(
+                "  scFM output requires_grad: %s",
+                scfm_gene_embeddings.requires_grad,
+            )
+            logger.info(
+                "  Cell-M input shape: %s", tuple(scfm_gene_embeddings.shape)
             )
             logger.info("  z_ctx shape: %s", tuple(output["z_ctx"].shape))
             logger.info("  A_ctx shape: %s", tuple(output["A_ctx"].shape))
@@ -267,6 +425,7 @@ class CellGuidedGraphTrainer:
     @torch.no_grad()
     def evaluate_bundle(self, bundle, edge_data):
         self.model.eval()
+        self.scfm_encoder.eval()
         output = self.forward(bundle, edge_data[:, :2], evaluation=True)
         labels = to_binary_label(edge_data[:, -1])
         return safe_evaluation(output["probabilities"], labels)
@@ -283,13 +442,39 @@ class CellGuidedGraphTrainer:
 
     def train(self):
         bundles = prepare_condition_bundles(self.args, self.device)
+        if self.args.scfm_mode != "precomputed" and len(bundles) != 1:
+            raise ValueError(
+                "Online scFM mode currently accepts one tokenized condition at a "
+                "time. Run one --cell_type per tokenized input."
+            )
         # A_prior is built only from the optimization subset's positive labels.
         # TODO: prefer a wholly external biological prior when one is available.
+        self.scfm_encoder = ScFMEncoder(self.args, self.device).to(self.device)
         self.model = self.get_model(bundles)
-        optimizer = getattr(optim, self.args.optimizer_name)(
-            (p for p in self.model.parameters() if p.requires_grad),
-            lr=self.args.gnn_lr,
-            weight_decay=self.args.gnn_weight_decay,
+        optimizer = self.build_optimizer()
+        amp_enabled = self.args.amp and self.device.type == "cuda"
+        if self.args.amp and not amp_enabled:
+            logger.warning("--amp requested without CUDA; AMP is disabled.")
+        scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+        optimized_parameters = [
+            parameter
+            for group in optimizer.param_groups
+            for parameter in group["params"]
+        ]
+        total_scfm, trainable_scfm = self.scfm_encoder.parameter_counts()
+        trainable_downstream = sum(
+            parameter.numel()
+            for parameter in self.model.parameters()
+            if parameter.requires_grad
+        )
+        logger.info(
+            "scfm_mode=%s backbone_loaded=%s trainable_scfm_params=%d/%d "
+            "trainable_downstream_params=%d",
+            self.args.scfm_mode,
+            self.scfm_encoder.backbone_loaded,
+            trainable_scfm,
+            total_scfm,
+            trainable_downstream,
         )
         loaders = {
             bundle.cell_type: DataLoader(
@@ -309,6 +494,7 @@ class CellGuidedGraphTrainer:
 
         for epoch in tqdm(range(self.args.gnn_epochs)):
             self.model.train()
+            self.scfm_encoder.train()
             totals = {"total": 0.0, "bce": 0.0, "sparse": 0.0}
             sparse_loss_basis = None
             steps = 0
@@ -318,8 +504,25 @@ class CellGuidedGraphTrainer:
                 ):
                     edge_pairs = edge_pairs.to(self.device)
                     labels = to_binary_label(train_y.to(self.device))
-                    optimizer.zero_grad()
-                    output = self.forward(bundle, edge_pairs)
+                    optimizer.zero_grad(set_to_none=True)
+                    try:
+                        with torch.amp.autocast(
+                            device_type=self.device.type, enabled=amp_enabled
+                        ):
+                            output = self.forward(bundle, edge_pairs)
+                            (
+                                total_loss,
+                                bce_loss,
+                                sparse_loss_used,
+                                batch_sparse_loss_basis,
+                            ) = self.loss(output, labels, bundle)
+                    except torch.cuda.OutOfMemoryError as exc:
+                        raise RuntimeError(
+                            "Training ran out of GPU memory. Reduce "
+                            "--max_scfm_cells, prefer online_lora over "
+                            "online_topk, lower --batch_size, or disable --amp "
+                            "only if mixed precision is unstable."
+                        ) from exc
                     if epoch == 0 and bundle_index == 0 and batch_index == 0:
                         candidate_mask = output.get("candidate_mask")
                         if output.get("gate") is not None:
@@ -336,12 +539,6 @@ class CellGuidedGraphTrainer:
                             logger, "A_final", output["A_final"], candidate_mask
                         )
                     self.verify_gradient_path(output)
-                    (
-                        total_loss,
-                        bce_loss,
-                        sparse_loss_used,
-                        batch_sparse_loss_basis,
-                    ) = self.loss(output, labels, bundle)
                     if sparse_loss_basis is None:
                         sparse_loss_basis = batch_sparse_loss_basis
                     elif sparse_loss_basis != batch_sparse_loss_basis:
@@ -349,8 +546,24 @@ class CellGuidedGraphTrainer:
                             "Sparse loss basis changed within an epoch: "
                             f"{sparse_loss_basis} -> {batch_sparse_loss_basis}"
                         )
-                    total_loss.backward()
-                    optimizer.step()
+                    scaler.scale(total_loss).backward()
+                    scaler.unscale_(optimizer)
+                    if (
+                        epoch == 0
+                        and bundle_index == 0
+                        and batch_index == 0
+                        and not self._checked_post_backward_gradients
+                    ):
+                        check_trainable_gradients_after_backward(
+                            self.model, self.args, self.scfm_encoder
+                        )
+                        self._checked_post_backward_gradients = True
+                    if self.args.grad_clip_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(
+                            optimized_parameters, self.args.grad_clip_norm
+                        )
+                    scaler.step(optimizer)
+                    scaler.update()
                     totals["total"] += total_loss.item()
                     totals["bce"] += bce_loss.item()
                     totals["sparse"] += sparse_loss_used.item()
@@ -367,7 +580,15 @@ class CellGuidedGraphTrainer:
                 best_valid_auc, best_valid_aupr = macro_auc, macro_aupr
                 patience_count = 0
                 self.args.ckpt_name = checkpoint_path
-                torch.save(self.model.state_dict(), checkpoint_path)
+                checkpoint = {"model": self.model.state_dict()}
+                if self.args.scfm_mode != "precomputed":
+                    checkpoint["scfm_encoder"] = self.scfm_encoder.state_dict()
+                torch.save(
+                    checkpoint
+                    if self.args.scfm_mode != "precomputed"
+                    else checkpoint["model"],
+                    checkpoint_path,
+                )
                 save_args(self.args, self.args.ckpt_dir)
                 saved_checkpoint = True
             else:
@@ -396,7 +617,12 @@ class CellGuidedGraphTrainer:
                 break
 
         if saved_checkpoint:
-            self.model.load_state_dict(torch.load(checkpoint_path, map_location=self.device))
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            if self.args.scfm_mode == "precomputed":
+                self.model.load_state_dict(checkpoint)
+            else:
+                self.model.load_state_dict(checkpoint["model"])
+                self.scfm_encoder.load_state_dict(checkpoint["scfm_encoder"])
         test_metrics, test_auc, test_aupr = self.evaluate_all(bundles, "test")
         for cell_type, metric in test_metrics.items():
             logger.info("Final test[%s] AUROC=%.4f AUPRC=%.4f", cell_type, metric["auroc"], metric["auprc"])
@@ -422,9 +648,11 @@ def main():
     set_seed(args.random_seed)
     logger.critical(
         "Training serial CellGuidedGraphScRegNet on %s with scFM=%s, "
+        "scfm_mode=%s, "
         "constructor=%s, graph_fusion_type=%s, alpha=%.3f",
         ",".join(requested_cell_types(args)),
         args.llm_type,
+        args.scfm_mode,
         args.graph_constructor_type,
         args.graph_fusion_type,
         args.graph_alpha,

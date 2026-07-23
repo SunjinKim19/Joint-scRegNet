@@ -11,7 +11,16 @@ import torch.nn.functional as F
 class CellM(nn.Module):
     """Produce per-gene context embeddings from scFM and raw expression inputs."""
 
-    def __init__(self, scfm_dim, num_genes, hidden_dim=256, latent_dim=128, dropout=0.2, scfm_tune_mode="adapter"):
+    def __init__(
+        self,
+        scfm_dim,
+        num_genes,
+        hidden_dim=256,
+        latent_dim=128,
+        dropout=0.2,
+        scfm_tune_mode="adapter",
+        detach_scfm_input=True,
+    ):
         super().__init__()
         if scfm_tune_mode in ("top", "full"):
             warnings.warn(
@@ -21,6 +30,7 @@ class CellM(nn.Module):
             scfm_tune_mode = "adapter"
         if scfm_tune_mode not in ("frozen_embedding", "adapter"):
             raise ValueError("scfm_tune_mode must be frozen_embedding or adapter")
+        self.detach_scfm_input = detach_scfm_input
         self.scfm_adapter = nn.Sequential(
             nn.Linear(scfm_dim, hidden_dim),
             nn.ReLU(),
@@ -39,8 +49,12 @@ class CellM(nn.Module):
         self.condition_norm = nn.LayerNorm(latent_dim)
 
     def forward(self, scfm_gene_emb, raw_expr=None):
-        # The upstream scFM tensor is frozen; gradients still train this Cell-M adapter.
-        z_ctx = self.scfm_adapter(scfm_gene_emb.detach())
+        # Precomputed/frozen modes detach external features. True online
+        # fine-tuning modes must preserve the graph back into the scFM backbone.
+        scfm_input = (
+            scfm_gene_emb.detach() if self.detach_scfm_input else scfm_gene_emb
+        )
+        z_ctx = self.scfm_adapter(scfm_input)
         z_cell = None
         if raw_expr is not None:
             if raw_expr.dim() != 2 or raw_expr.size(1) != self.cell_encoder[0].in_features:
@@ -280,6 +294,7 @@ class CellGuidedGraphScRegNet(nn.Module):
         gate_temperature=1.0,
         gate_init_from_alpha=True,
         scfm_tune_mode="adapter",
+        detach_scfm_input=True,
     ):
         super().__init__()
         if not 0.0 <= graph_alpha <= 1.0:
@@ -297,6 +312,7 @@ class CellGuidedGraphScRegNet(nn.Module):
             latent_dim=latent_dim,
             dropout=dropout,
             scfm_tune_mode=scfm_tune_mode,
+            detach_scfm_input=detach_scfm_input,
         )
         self.graph_constructor = GraphConstructor(
             latent_dim=latent_dim,

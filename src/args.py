@@ -213,6 +213,43 @@ def parse_args():
     parser.add_argument("--freeze_scfm", type=str2bool, default=True)
     parser.add_argument("--train_scfm_adapter", type=str2bool, default=True)
     parser.add_argument("--train_scfm_top_layers", type=int, default=0)
+    parser.add_argument(
+        "--scfm_mode",
+        type=str,
+        default="precomputed",
+        choices=["precomputed", "online_frozen", "online_lora", "online_topk"],
+    )
+    parser.add_argument("--scfm_model_path", type=str, default=None)
+    parser.add_argument("--scfm_tokenized_path", type=str, default=None)
+    parser.add_argument("--scfm_output_layer", type=str, default="last_hidden")
+    parser.add_argument(
+        "--scfm_pooling",
+        type=str,
+        default="gene",
+        choices=["gene", "cell", "mean"],
+    )
+    parser.add_argument("--lora_rank", type=int, default=8)
+    parser.add_argument("--lora_alpha", type=int, default=16)
+    parser.add_argument("--lora_dropout", type=float, default=0.05)
+    parser.add_argument(
+        "--lora_target_modules", type=str, default="query,value"
+    )
+    parser.add_argument("--scfm_lr", type=float, default=1e-5)
+    parser.add_argument("--downstream_lr", type=float, default=1e-3)
+    parser.add_argument("--scfm_weight_decay", type=float, default=0.01)
+    parser.add_argument("--downstream_weight_decay", type=float, default=1e-4)
+    parser.add_argument("--max_scfm_cells", type=int, default=0)
+    parser.add_argument(
+        "--cache_online_scfm_outputs", action="store_true", default=False
+    )
+    parser.add_argument(
+        "--no_cache_online_scfm_outputs",
+        dest="cache_online_scfm_outputs",
+        action="store_false",
+    )
+    parser.add_argument("--amp", dest="amp", action="store_true", default=False)
+    parser.add_argument("--no_amp", dest="amp", action="store_false")
+    parser.add_argument("--grad_clip_norm", type=float, default=1.0)
 
     args = parser.parse_args()
     return args
