@@ -220,6 +220,22 @@ def parse_args():
         choices=["precomputed", "online_frozen", "online_lora", "online_topk"],
     )
     parser.add_argument("--scfm_model_path", type=str, default=None)
+    parser.add_argument(
+        "--scfm_model_repo", type=str, default="ctheodoris/Geneformer"
+    )
+    parser.add_argument(
+        "--scfm_model_subfolder", type=str, default="Geneformer-V1-10M"
+    )
+    parser.add_argument("--scfm_token_dictionary_path", type=str, default=None)
+    parser.add_argument(
+        "--scfm_token_dictionary_file",
+        type=str,
+        default="geneformer/gene_dictionaries_30m/token_dictionary_gc30M.pkl",
+    )
+    parser.add_argument("--hf_cache_dir", type=str, default=None)
+    parser.add_argument(
+        "--scfm_model_version", choices=["V1", "V2"], default="V1"
+    )
     parser.add_argument("--scfm_tokenized_path", type=str, default=None)
     parser.add_argument("--scfm_output_layer", type=str, default="last_hidden")
     parser.add_argument(
@@ -229,6 +245,9 @@ def parse_args():
         choices=["gene", "cell", "mean"],
     )
     parser.add_argument("--lora_rank", type=int, default=8)
+    parser.add_argument(
+        "--lora_r", type=int, default=None, help="Alias overriding --lora_rank."
+    )
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
     parser.add_argument(
@@ -239,6 +258,13 @@ def parse_args():
     parser.add_argument("--scfm_weight_decay", type=float, default=0.01)
     parser.add_argument("--downstream_weight_decay", type=float, default=1e-4)
     parser.add_argument("--max_scfm_cells", type=int, default=0)
+    parser.add_argument("--scfm_cell_batch_size", type=int, default=8)
+    parser.add_argument(
+        "--scfm_cell_sampling",
+        choices=["all", "fixed_random"],
+        default="fixed_random",
+    )
+    parser.add_argument("--scfm_seed", type=int, default=0)
     parser.add_argument(
         "--cache_online_scfm_outputs", action="store_true", default=False
     )
@@ -250,6 +276,16 @@ def parse_args():
     parser.add_argument("--amp", dest="amp", action="store_true", default=False)
     parser.add_argument("--no_amp", dest="amp", action="store_false")
     parser.add_argument("--grad_clip_norm", type=float, default=1.0)
+    parser.add_argument(
+        "--gradient_checkpointing", action="store_true", default=False
+    )
+    parser.add_argument("--limit_train_edges", type=int, default=0)
+    parser.add_argument("--limit_valid_edges", type=int, default=0)
+    parser.add_argument("--limit_test_edges", type=int, default=0)
+    parser.add_argument("--resume_checkpoint", type=str, default=None)
+    parser.add_argument(
+        "--allow_token_artifact_mismatch", action="store_true", default=False
+    )
 
     args = parser.parse_args()
     return args

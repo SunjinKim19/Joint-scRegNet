@@ -8,17 +8,73 @@ silently substitutes precomputed CSV embeddings for requested fine-tuning.
 import logging
 import os
 import pickle
+import hashlib
 
 import torch
 import torch.nn as nn
 
+from src.geneformer_assets import resolve_geneformer_assets
+
 logger = logging.getLogger(__name__)
+
+
+class GeneRepresentationPooler(nn.Module):
+    """Scatter token hidden states back to the immutable GRN gene index."""
+
+    def __init__(self, num_genes, hidden_dim):
+        super().__init__()
+        self.num_genes = num_genes
+        self.hidden_dim = hidden_dim
+        self.fallback_gene_embeddings = nn.Embedding(num_genes, hidden_dim)
+        nn.init.normal_(self.fallback_gene_embeddings.weight, std=0.02)
+
+    def accumulate(self, hidden, attention_mask, gene_index_map):
+        if hidden.dim() != 3:
+            raise ValueError(f"hidden must be [B, L, H], got {tuple(hidden.shape)}")
+        if attention_mask.shape != hidden.shape[:2]:
+            raise ValueError("attention_mask shape must match hidden [B, L]")
+        if gene_index_map.shape != hidden.shape[:2]:
+            raise ValueError("gene_index_map shape must match hidden [B, L]")
+        valid = attention_mask.bool() & gene_index_map.ge(0)
+        valid = valid & gene_index_map.lt(self.num_genes)
+        flat_indices = gene_index_map[valid].long()
+        flat_hidden = hidden[valid]
+        gene_sum = hidden.new_zeros((self.num_genes, self.hidden_dim))
+        gene_count = hidden.new_zeros((self.num_genes, 1))
+        gene_sum.index_add_(0, flat_indices, flat_hidden)
+        gene_count.index_add_(
+            0,
+            flat_indices,
+            torch.ones(
+                (flat_indices.numel(), 1),
+                dtype=hidden.dtype,
+                device=hidden.device,
+            ),
+        )
+        return gene_sum, gene_count
+
+    def finalize(self, gene_sum, gene_count):
+        pooled = gene_sum / gene_count.clamp_min(1)
+        observed = gene_count.squeeze(-1).gt(0)
+        return torch.where(
+            observed.unsqueeze(-1), pooled, self.fallback_gene_embeddings.weight
+        )
+
+    def forward(self, hidden, attention_mask, gene_index_map):
+        return self.finalize(
+            *self.accumulate(hidden, attention_mask, gene_index_map)
+        )
 
 
 class ScFMEncoder(nn.Module):
     ONLINE_MODES = {"online_frozen", "online_lora", "online_topk"}
     MODEL_INPUT_KEYS = ("input_ids", "attention_mask", "token_type_ids")
-    GENE_MAPPING_KEYS = ("token_gene_indices", "gene_indices", "gene_ids")
+    GENE_MAPPING_KEYS = (
+        "gene_index_map",
+        "token_gene_indices",
+        "gene_indices",
+        "gene_ids",
+    )
 
     def __init__(self, args, device):
         super().__init__()
@@ -28,7 +84,13 @@ class ScFMEncoder(nn.Module):
         self.model = None
         self.tokenized_data = None
         self.output_dim = None
+        self.num_original_genes = None
+        self.gene_pooler = None
         self._cached_gene_embeddings = None
+        self.last_diagnostics = {}
+        self.assets = None
+        self.artifact_fingerprint = None
+        self.artifact_metadata = {}
 
         if self.mode == "precomputed":
             logger.info(
@@ -39,12 +101,23 @@ class ScFMEncoder(nn.Module):
         if self.mode not in self.ONLINE_MODES:
             raise ValueError(f"Unsupported scfm_mode: {self.mode}")
         self._validate_online_paths()
+        self.assets = resolve_geneformer_assets(
+            args, require_token_dictionary=False
+        )
         self.tokenized_data = self._load_tokenized_data(args.scfm_tokenized_path)
-        self.model = self._load_huggingface_model(args.scfm_model_path)
+        self.artifact_fingerprint = self._sha256(args.scfm_tokenized_path)
+        self.artifact_metadata = dict(self.tokenized_data.get("metadata", {}))
+        self.model = self._load_huggingface_model(self.assets, args.hf_cache_dir)
         self.model.to(device)
         self.output_dim = self._infer_hidden_size()
+        self.num_original_genes = self._infer_original_gene_count()
+        self.gene_pooler = GeneRepresentationPooler(
+            self.num_original_genes, self.output_dim
+        ).to(device)
         self._configure_trainable_parameters()
+        self._configure_gradient_checkpointing()
         self._validate_cache_policy()
+        self.selected_cell_indices = self._select_cells()
         self._log_parameter_summary()
 
     @property
@@ -53,8 +126,8 @@ class ScFMEncoder(nn.Module):
 
     def _validate_online_paths(self):
         missing = []
-        if not self.args.scfm_model_path:
-            missing.append("--scfm_model_path (checkpoint path or HuggingFace name)")
+        if not self.args.scfm_model_path and not self.args.scfm_model_repo:
+            missing.append("--scfm_model_path or --scfm_model_repo")
         if not self.args.scfm_tokenized_path:
             missing.append("--scfm_tokenized_path (tokenized cell input)")
         if missing:
@@ -72,7 +145,7 @@ class ScFMEncoder(nn.Module):
             )
 
     @staticmethod
-    def _load_huggingface_model(model_path):
+    def _load_huggingface_model(assets, cache_dir):
         try:
             from transformers import AutoModel
         except ImportError as exc:
@@ -82,10 +155,18 @@ class ScFMEncoder(nn.Module):
                 "--scfm_model_path."
             ) from exc
         try:
-            return AutoModel.from_pretrained(model_path)
+            if assets.model_path:
+                return AutoModel.from_pretrained(
+                    assets.model_path, cache_dir=cache_dir
+                )
+            return AutoModel.from_pretrained(
+                assets.model_repo,
+                subfolder=assets.model_subfolder,
+                cache_dir=cache_dir,
+            )
         except Exception as exc:
             raise RuntimeError(
-                f"Failed to load the scFM model from '{model_path}' with "
+                f"Failed to load the scFM model from '{assets.model_identity}' with "
                 "transformers.AutoModel. Verify that it is a local checkpoint or "
                 "a reachable HuggingFace model and that its custom dependencies "
                 f"are installed. Original error: {exc}"
@@ -169,6 +250,14 @@ class ScFMEncoder(nn.Module):
         return normalized
 
     @staticmethod
+    def _sha256(path):
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    @staticmethod
     def _to_tensor_with_padding(value, padding_value=0):
         try:
             return torch.as_tensor(value)
@@ -192,6 +281,64 @@ class ScFMEncoder(nn.Module):
             "Could not infer the scFM output dimension from model.config. "
             "Expected hidden_size, d_model, or n_embd."
         )
+
+    def _infer_original_gene_count(self):
+        metadata_count = self.tokenized_data.get("metadata", {}).get(
+            "original_gene_count"
+        )
+        candidates = [
+            metadata_count,
+            len(self.tokenized_data.get("gene_symbols", [])) or None,
+            (
+                int(self.tokenized_data["gene_token_ids"].numel())
+                if isinstance(self.tokenized_data.get("gene_token_ids"), torch.Tensor)
+                else None
+            ),
+        ]
+        mapping_key = next(
+            key for key in self.GENE_MAPPING_KEYS if key in self.tokenized_data
+        )
+        mapping = self.tokenized_data[mapping_key]
+        valid = mapping[mapping >= 0]
+        candidates.append(int(valid.max()) + 1 if valid.numel() else None)
+        count = next(
+            (int(value) for value in candidates if value is not None and int(value) > 0),
+            None,
+        )
+        if count is None:
+            raise ValueError("Could not infer original gene count from token artifact")
+        return count
+
+    def _configure_gradient_checkpointing(self):
+        if not self.args.gradient_checkpointing:
+            return
+        enable = getattr(self.model, "gradient_checkpointing_enable", None)
+        if not callable(enable):
+            raise ValueError(
+                "--gradient_checkpointing was requested but this scFM model "
+                "does not expose gradient_checkpointing_enable()."
+            )
+        enable()
+        logger.info("Enabled scFM gradient checkpointing")
+
+    def _select_cells(self):
+        cell_count = self.tokenized_data["input_ids"].size(0)
+        maximum = self.args.max_scfm_cells
+        selected_count = cell_count if maximum <= 0 else min(maximum, cell_count)
+        if self.args.scfm_cell_sampling == "all":
+            indices = torch.arange(selected_count)
+        else:
+            generator = torch.Generator().manual_seed(self.args.scfm_seed)
+            indices = torch.randperm(cell_count, generator=generator)[:selected_count]
+            indices = indices.sort().values
+        logger.info(
+            "Selected %d/%d scFM cells using %s (seed=%d)",
+            selected_count,
+            cell_count,
+            self.args.scfm_cell_sampling,
+            self.args.scfm_seed,
+        )
+        return indices
 
     def _configure_trainable_parameters(self):
         for parameter in self.model.parameters():
@@ -251,7 +398,9 @@ class ScFMEncoder(nn.Module):
             )
         config = LoraConfig(
             task_type=TaskType.FEATURE_EXTRACTION,
-            r=self.args.lora_rank,
+            r=self.args.lora_r
+            if self.args.lora_r is not None
+            else self.args.lora_rank,
             lora_alpha=self.args.lora_alpha,
             lora_dropout=self.args.lora_dropout,
             target_modules=targets,
@@ -262,7 +411,9 @@ class ScFMEncoder(nn.Module):
             raise RuntimeError("PEFT created zero trainable LoRA parameters")
         logger.info(
             "LoRA enabled: rank=%d alpha=%d dropout=%.4f targets=%s",
-            self.args.lora_rank,
+            self.args.lora_r
+            if self.args.lora_r is not None
+            else self.args.lora_rank,
             self.args.lora_alpha,
             self.args.lora_dropout,
             targets,
@@ -342,11 +493,33 @@ class ScFMEncoder(nn.Module):
         )
         return total, trainable
 
+    def backbone_trainable_parameters(self):
+        if self.model is None:
+            return []
+        return [
+            parameter
+            for parameter in self.model.parameters()
+            if parameter.requires_grad
+        ]
+
+    def fallback_parameters(self):
+        if self.gene_pooler is None:
+            return []
+        return list(self.gene_pooler.fallback_gene_embeddings.parameters())
+
     def _log_parameter_summary(self):
         total, trainable = self.parameter_counts()
         percentage = 100.0 * trainable / max(1, total)
         logger.info("scFM mode=%s", self.mode)
-        logger.info("Loaded scFM model from %s", self.args.scfm_model_path)
+        logger.info("Loaded scFM model from %s", self.assets.model_identity)
+        logger.info(
+            "Actual scFM model class=%s hidden_size=%d token_artifact=%s "
+            "original_gene_count=%d",
+            self.model.__class__.__name__,
+            self.output_dim,
+            self.args.scfm_tokenized_path,
+            self.num_original_genes,
+        )
         logger.info(
             "Trainable scFM parameters: %d / %d (%.4f%%)",
             trainable,
@@ -359,12 +532,6 @@ class ScFMEncoder(nn.Module):
         if self.mode == "online_frozen" and self.model is not None:
             self.model.eval()
         return self
-
-    def _slice_cells(self, tensor):
-        maximum = self.args.max_scfm_cells
-        if maximum > 0 and tensor.dim() > 0:
-            return tensor[:maximum]
-        return tensor
 
     def _extract_hidden_state(self, outputs):
         output_layer = self.args.scfm_output_layer
@@ -409,15 +576,15 @@ class ScFMEncoder(nn.Module):
             )
         return hidden
 
-    def _direct_gene_indices(self, num_genes, cell_count, token_count):
+    def _direct_gene_indices(self, num_genes, cell_indices, token_count):
         mapping_key = next(
             key for key in self.GENE_MAPPING_KEYS if key in self.tokenized_data
         )
-        mapping = self._slice_cells(self.tokenized_data[mapping_key])
-        if mapping.shape != (cell_count, token_count):
+        mapping = self.tokenized_data[mapping_key].index_select(0, cell_indices)
+        if mapping.shape != (cell_indices.numel(), token_count):
             raise ValueError(
                 f"Token-to-gene mapping '{mapping_key}' must have shape "
-                f"[{cell_count}, {token_count}], got {tuple(mapping.shape)}"
+                f"[{cell_indices.numel()}, {token_count}], got {tuple(mapping.shape)}"
             )
         mapping = mapping.long()
         if mapping_key == "gene_ids" and "target_gene_ids" in self.tokenized_data:
@@ -443,45 +610,82 @@ class ScFMEncoder(nn.Module):
             )
         return mapping
 
-    def _pool_gene_embeddings(self, hidden, num_genes):
+    def _pool_batch(self, hidden, num_genes, cell_indices):
         if self.args.scfm_pooling != "gene":
             raise ValueError(
                 "CellGuidedGraphScRegNet requires gene-level [num_genes, dim] "
                 f"embeddings, but --scfm_pooling={self.args.scfm_pooling} was "
                 "requested. Use --scfm_pooling gene with a token-to-gene mapping."
             )
-        cells, tokens, hidden_dim = hidden.shape
-        mapping = self._direct_gene_indices(num_genes, cells, tokens).to(hidden.device)
-        valid = mapping >= 0
+        _, tokens, _ = hidden.shape
+        mapping = self._direct_gene_indices(
+            num_genes, cell_indices, tokens
+        ).to(hidden.device)
         attention_mask = self.tokenized_data.get("attention_mask")
-        if attention_mask is not None:
-            attention_mask = self._slice_cells(attention_mask).to(hidden.device)
-            if attention_mask.shape != mapping.shape:
-                raise ValueError(
-                    "attention_mask shape must match token-to-gene mapping, got "
-                    f"{tuple(attention_mask.shape)} and {tuple(mapping.shape)}"
-                )
-            valid = valid & attention_mask.bool()
-        flat_indices = mapping[valid]
-        flat_hidden = hidden[valid]
-        sums = hidden.new_zeros((num_genes, hidden_dim))
-        counts = hidden.new_zeros((num_genes, 1))
-        sums.index_add_(0, flat_indices, flat_hidden)
-        counts.index_add_(
-            0,
-            flat_indices,
-            torch.ones(
-                (flat_indices.numel(), 1), device=hidden.device, dtype=hidden.dtype
-            ),
-        )
-        missing = (counts.squeeze(-1) == 0).nonzero(as_tuple=False).view(-1)
-        if missing.numel():
-            raise ValueError(
-                "Cannot construct complete gene-level embeddings: tokenized "
-                f"input has no valid token for {missing.numel()} of {num_genes} "
-                f"genes. First missing indices: {missing[:20].tolist()}"
+        if attention_mask is None:
+            attention_mask = mapping.ge(0)
+        else:
+            attention_mask = attention_mask.index_select(0, cell_indices)
+        attention_mask = attention_mask.to(hidden.device)
+        return self.gene_pooler.accumulate(hidden, attention_mask, mapping)
+
+    def _model_forward_for_cells(self, cell_indices):
+        model_inputs = {}
+        for key in self.MODEL_INPUT_KEYS:
+            value = self.tokenized_data.get(key)
+            if value is not None:
+                model_inputs[key] = value.index_select(0, cell_indices).to(self.device)
+        try:
+            outputs = self.model(
+                **model_inputs, output_hidden_states=True, return_dict=True
             )
-        return sums / counts
+        except torch.cuda.OutOfMemoryError as exc:
+            raise RuntimeError(
+                "scFM forward ran out of GPU memory. Reduce --max_scfm_cells or "
+                "--scfm_cell_batch_size, and prefer online_lora over online_topk."
+            ) from exc
+        return self._extract_hidden_state(outputs)
+
+    def _pool_selected_cells(self, num_genes):
+        if num_genes != self.num_original_genes:
+            raise ValueError(
+                "Token artifact original gene count does not match downstream "
+                f"graph: {self.num_original_genes} vs {num_genes}. The 910-gene "
+                "GRN index space must not be reordered or reduced."
+            )
+        batch_size = self.args.scfm_cell_batch_size
+        if batch_size <= 0:
+            raise ValueError("--scfm_cell_batch_size must be positive")
+        total_sum = None
+        total_count = None
+        for cell_indices in self.selected_cell_indices.split(batch_size):
+            hidden = self._model_forward_for_cells(cell_indices)
+            batch_sum, batch_count = self._pool_batch(
+                hidden, num_genes, cell_indices
+            )
+            total_sum = batch_sum if total_sum is None else total_sum + batch_sum
+            total_count = (
+                batch_count if total_count is None else total_count + batch_count
+            )
+        output = self.gene_pooler.finalize(total_sum, total_count)
+        observed = total_count.squeeze(-1).gt(0)
+        tokenizable = self.tokenized_data.get("tokenizable_gene_mask")
+        tokenizable_count = (
+            int(tokenizable.sum())
+            if isinstance(tokenizable, torch.Tensor)
+            else int(observed.sum())
+        )
+        self.last_diagnostics = {
+            "pooled_gene_count": int(observed.sum()),
+            "fallback_gene_count": int((~observed).sum()),
+            "tokenizable_gene_count": tokenizable_count,
+            "selected_cell_count": int(self.selected_cell_indices.numel()),
+            "minimum_observation_count": float(total_count.min()),
+            "maximum_observation_count": float(total_count.max()),
+            "output_shape": tuple(output.shape),
+        }
+        logger.info("Gene pooling diagnostics: %s", self.last_diagnostics)
+        return output
 
     def forward(self, context):
         if self.mode == "precomputed":
@@ -501,23 +705,7 @@ class ScFMEncoder(nn.Module):
         num_genes = context.get("num_genes") if isinstance(context, dict) else None
         if not isinstance(num_genes, int) or num_genes <= 0:
             raise ValueError("Online scFM forward requires integer context['num_genes']")
-        model_inputs = {}
-        for key in self.MODEL_INPUT_KEYS:
-            value = self.tokenized_data.get(key)
-            if value is not None:
-                model_inputs[key] = self._slice_cells(value).to(self.device)
-        try:
-            outputs = self.model(
-                **model_inputs, output_hidden_states=True, return_dict=True
-            )
-        except torch.cuda.OutOfMemoryError as exc:
-            raise RuntimeError(
-                "scFM forward ran out of GPU memory. Reduce --max_scfm_cells, "
-                "prefer --scfm_mode online_lora over online_topk, or reduce the "
-                "downstream edge batch size."
-            ) from exc
-        hidden = self._extract_hidden_state(outputs)
-        gene_embeddings = self._pool_gene_embeddings(hidden, num_genes)
+        gene_embeddings = self._pool_selected_cells(num_genes)
         if self.args.cache_online_scfm_outputs:
             # Only online_frozen reaches this branch; no trainable graph is detached.
             self._cached_gene_embeddings = gene_embeddings.detach()

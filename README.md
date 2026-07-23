@@ -216,6 +216,46 @@ Top-layer fine-tuning uses `--scfm_mode online_topk` with
 detached; the first training batch checks for a non-zero scFM gradient after
 the normal backward pass.
 
+#### hESC Geneformer V1 data limitation
+
+The hESC benchmark provides a normalized, feature-selected expression matrix
+containing 910 genes rather than raw full-transcriptome counts. Therefore, this
+implementation uses custom rank-based tokenization over the genes available in
+the scRegNet dataset. This is actual task-specific Geneformer backbone
+fine-tuning when TF-target BCE gradients reach Geneformer LoRA parameters.
+However, it is not a reproduction of the official raw-count,
+full-transcriptome Geneformer tokenization pipeline.
+
+Prepare the immutable 910-gene token artifact:
+
+```bash
+python src/prepare_geneformer_tokens.py \
+  --expression_path ./data/hESC/TFs+500/BL--ExpressionData.csv \
+  --mapping_path ./scFM/Geneformer/hESC_500.csv \
+  --output_path ./artifacts/hESC_500_geneformer_v1_tokens.pt \
+  --scfm_model_version V1
+```
+
+GPU server container example:
+
+```bash
+docker run -it --rm \
+  --gpus '"device=3"' \
+  --name joint-scregnet-gpu3 \
+  -v /data1/project/kimsj0566/Joint-scRegNet:/workspace \
+  -v /data1/project/kimsj0566/hf-cache:/root/.cache/huggingface \
+  -w /workspace \
+  pytorch/pytorch:2.8.0-cuda12.9-cudnn9-runtime \
+  bash
+
+pip install -r requirements-online-scfm.txt
+bash scripts/smoke_hesc_geneformer_lora.sh
+bash scripts/train_hesc_geneformer_v1_lora.sh
+```
+
+Inside this container, host GPU 3 appears as `cuda:0`; continue to pass
+`--device cuda` to the training entry point.
+
 ## Acknowledgements
 
 We sincerely thank the authors of following open-source projects:

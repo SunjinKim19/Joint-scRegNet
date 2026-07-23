@@ -1,0 +1,6 @@
+# Optional dependencies for actual online Geneformer execution.
+# Keep the environment's existing PyTorch installation.
+transformers>=4.40,<5
+peft>=0.11,<1
+huggingface_hub>=0.23,<2
+safetensors>=0.4,<1

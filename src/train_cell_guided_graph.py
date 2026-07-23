@@ -125,6 +125,16 @@ def _has_nonzero_finite_gradient(parameters):
     )
 
 
+def _nonzero_gradient_count(parameters):
+    return sum(
+        1
+        for parameter in parameters
+        if parameter.grad is not None
+        and torch.isfinite(parameter.grad).all()
+        and parameter.grad.abs().sum().item() > 0
+    )
+
+
 def check_trainable_gradients_after_backward(model, args, scfm_encoder=None):
     """Verify the normal training backward reached the intended parameters."""
     downstream_parameters = [
@@ -156,11 +166,7 @@ def check_trainable_gradients_after_backward(model, args, scfm_encoder=None):
 
     if scfm_encoder is None or not scfm_encoder.backbone_loaded:
         raise RuntimeError(f"scfm_mode={args.scfm_mode} has no loaded scFM backbone")
-    scfm_trainable = [
-        parameter
-        for parameter in scfm_encoder.parameters()
-        if parameter.requires_grad
-    ]
+    scfm_trainable = scfm_encoder.backbone_trainable_parameters()
     if args.scfm_mode == "online_frozen":
         if scfm_trainable:
             raise RuntimeError("online_frozen has trainable scFM parameters")
@@ -178,10 +184,24 @@ def check_trainable_gradients_after_backward(model, args, scfm_encoder=None):
             f"True fine-tuning check failed: no non-zero gradient reached "
             f"{args.scfm_mode} scFM parameters. Ensure scFM outputs are not detached."
         )
+    adapter_parameters = [
+        parameter
+        for parameter in model.cell_m.scfm_adapter.parameters()
+        if parameter.requires_grad
+    ]
+    if adapter_parameters and not _has_nonzero_finite_gradient(adapter_parameters):
+        raise RuntimeError("No non-zero gradient reached the Cell-M adapter")
     logger.info(
         "Post-backward gradient check passed: scfm_mode=%s, "
-        "scFM_trainable_grad=True, downstream_grad=True",
+        "scFM_backbone_loaded=True, scFM_trainable_parameter_count=%d, "
+        "scFM_nonzero_grad_parameter_count=%d, Cell-M_adapter_grad=%s, "
+        "downstream_grad=True",
         args.scfm_mode,
+        len(scfm_trainable),
+        _nonzero_gradient_count(scfm_trainable),
+        _has_nonzero_finite_gradient(adapter_parameters)
+        if adapter_parameters
+        else None,
     )
 
 
@@ -264,6 +284,11 @@ class CellGuidedGraphTrainer:
         downstream_parameters = [
             parameter for parameter in self.model.parameters() if parameter.requires_grad
         ]
+        downstream_parameters.extend(
+            parameter
+            for parameter in self.scfm_encoder.fallback_parameters()
+            if parameter.requires_grad
+        )
         if not downstream_parameters:
             raise RuntimeError("No trainable downstream parameters were found")
         parameter_groups = [
@@ -279,11 +304,7 @@ class CellGuidedGraphTrainer:
             self.args.downstream_lr,
             self.args.downstream_weight_decay,
         )
-        scfm_parameters = [
-            parameter
-            for parameter in self.scfm_encoder.parameters()
-            if parameter.requires_grad
-        ]
+        scfm_parameters = self.scfm_encoder.backbone_trainable_parameters()
         if self.args.scfm_mode in ("online_lora", "online_topk"):
             if not scfm_parameters:
                 raise RuntimeError(
@@ -308,7 +329,127 @@ class CellGuidedGraphTrainer:
                 f"scfm_mode={self.args.scfm_mode} unexpectedly has trainable "
                 "backbone parameters"
             )
+        parameter_ids = [
+            id(parameter)
+            for group in parameter_groups
+            for parameter in group["params"]
+        ]
+        if len(parameter_ids) != len(set(parameter_ids)):
+            raise RuntimeError("Optimizer parameter groups contain duplicate parameters")
+        expected_ids = {
+            id(parameter)
+            for parameter in (
+                list(self.model.parameters()) + list(self.scfm_encoder.parameters())
+            )
+            if parameter.requires_grad
+        }
+        if set(parameter_ids) != expected_ids:
+            missing = expected_ids - set(parameter_ids)
+            extra = set(parameter_ids) - expected_ids
+            raise RuntimeError(
+                "Optimizer parameter coverage mismatch: "
+                f"missing={len(missing)} extra={len(extra)}"
+            )
         return getattr(optim, self.args.optimizer_name)(parameter_groups)
+
+    @staticmethod
+    def _limit_bundle_edges(bundle, args):
+        if args.limit_train_edges > 0:
+            bundle.train_dataset.train_set = bundle.train_dataset.train_set[
+                : args.limit_train_edges
+            ]
+        if args.limit_valid_edges > 0:
+            bundle.valid_data = bundle.valid_data[: args.limit_valid_edges]
+        if args.limit_test_edges > 0:
+            bundle.test_data = bundle.test_data[: args.limit_test_edges]
+
+    @staticmethod
+    def _validate_index_integrity(bundle):
+        num_genes = bundle.data_feature2.size(0)
+        tensors = {
+            "TF indices": bundle.tf_indices,
+            "train edges": torch.as_tensor(
+                bundle.train_dataset.train_set[:, :2],
+                device=bundle.tf_indices.device,
+            ),
+            "valid edges": bundle.valid_data[:, :2],
+            "test edges": bundle.test_data[:, :2],
+        }
+        for name, values in tensors.items():
+            if values.numel() and (values.min() < 0 or values.max() >= num_genes):
+                raise ValueError(
+                    f"{name} contains indices outside [0, {num_genes - 1}]"
+                )
+
+    def _checkpoint_payload(
+        self, epoch, optimizer, best_score, best_valid_auc, best_valid_aupr
+    ):
+        payload = {
+            "format_version": 2,
+            "model": self.model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "epoch": epoch,
+            "best_score": best_score,
+            "best_valid_auc": best_valid_auc,
+            "best_valid_aupr": best_valid_aupr,
+            "args": dict(vars(self.args)),
+            "random_seed": self.args.random_seed,
+            "scfm_mode": self.args.scfm_mode,
+        }
+        if self.args.scfm_mode != "precomputed":
+            payload.update(
+                {
+                    "scfm_encoder": self.scfm_encoder.state_dict(),
+                    "base_model_identity": self.scfm_encoder.assets.model_identity,
+                    "model_subfolder": self.scfm_encoder.assets.model_subfolder,
+                    "token_artifact_path": self.args.scfm_tokenized_path,
+                    "token_artifact_sha256": self.scfm_encoder.artifact_fingerprint,
+                    "token_artifact_metadata": self.scfm_encoder.artifact_metadata,
+                    "lora_config": {
+                        "r": self.args.lora_r
+                        if self.args.lora_r is not None
+                        else self.args.lora_rank,
+                        "alpha": self.args.lora_alpha,
+                        "dropout": self.args.lora_dropout,
+                        "targets": self.args.lora_target_modules,
+                    },
+                    "train_scfm_top_layers": self.args.train_scfm_top_layers,
+                }
+            )
+        return payload
+
+    def _load_resume_checkpoint(self, path, optimizer):
+        checkpoint = torch.load(path, map_location=self.device)
+        if not isinstance(checkpoint, dict) or "model" not in checkpoint:
+            if self.args.scfm_mode != "precomputed":
+                raise ValueError(
+                    "Legacy precomputed checkpoint cannot resume an online scFM run"
+                )
+            self.model.load_state_dict(checkpoint)
+            return 0, float("-inf"), float("nan"), float("nan")
+        self.model.load_state_dict(checkpoint["model"])
+        if self.args.scfm_mode != "precomputed":
+            saved_fingerprint = checkpoint.get("token_artifact_sha256")
+            current_fingerprint = self.scfm_encoder.artifact_fingerprint
+            if (
+                saved_fingerprint != current_fingerprint
+                and not self.args.allow_token_artifact_mismatch
+            ):
+                raise ValueError(
+                    "Token artifact fingerprint mismatch while resuming: "
+                    f"saved={saved_fingerprint} current={current_fingerprint}. "
+                    "Use --allow_token_artifact_mismatch only after verifying "
+                    "the 910-gene order manually."
+                )
+            self.scfm_encoder.load_state_dict(checkpoint["scfm_encoder"])
+        if "optimizer" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+        return (
+            int(checkpoint.get("epoch", -1)) + 1,
+            float(checkpoint.get("best_score", float("-inf"))),
+            float(checkpoint.get("best_valid_auc", float("nan"))),
+            float(checkpoint.get("best_valid_aupr", float("nan"))),
+        )
 
     def link_loss(self, logits, targets, pos_weight):
         if self.args.loss_type == "bce":
@@ -442,6 +583,9 @@ class CellGuidedGraphTrainer:
 
     def train(self):
         bundles = prepare_condition_bundles(self.args, self.device)
+        for bundle in bundles:
+            self._limit_bundle_edges(bundle, self.args)
+            self._validate_index_integrity(bundle)
         if self.args.scfm_mode != "precomputed" and len(bundles) != 1:
             raise ValueError(
                 "Online scFM mode currently accepts one tokenized condition at a "
@@ -491,8 +635,25 @@ class CellGuidedGraphTrainer:
         best_valid_auc = best_valid_aupr = float("nan")
         patience_count = 0
         saved_checkpoint = False
+        start_epoch = 0
+        if self.args.resume_checkpoint:
+            (
+                start_epoch,
+                best_score,
+                best_valid_auc,
+                best_valid_aupr,
+            ) = self._load_resume_checkpoint(
+                self.args.resume_checkpoint, optimizer
+            )
+            saved_checkpoint = True
+            checkpoint_path = self.args.resume_checkpoint
+            logger.info(
+                "Resumed checkpoint %s at epoch %d",
+                self.args.resume_checkpoint,
+                start_epoch,
+            )
 
-        for epoch in tqdm(range(self.args.gnn_epochs)):
+        for epoch in tqdm(range(start_epoch, self.args.gnn_epochs)):
             self.model.train()
             self.scfm_encoder.train()
             totals = {"total": 0.0, "bce": 0.0, "sparse": 0.0}
@@ -516,6 +677,10 @@ class CellGuidedGraphTrainer:
                                 sparse_loss_used,
                                 batch_sparse_loss_basis,
                             ) = self.loss(output, labels, bundle)
+                            if not torch.isfinite(total_loss):
+                                raise RuntimeError(
+                                    "Non-finite training loss encountered before backward"
+                                )
                     except torch.cuda.OutOfMemoryError as exc:
                         raise RuntimeError(
                             "Training ran out of GPU memory. Reduce "
@@ -549,8 +714,7 @@ class CellGuidedGraphTrainer:
                     scaler.scale(total_loss).backward()
                     scaler.unscale_(optimizer)
                     if (
-                        epoch == 0
-                        and bundle_index == 0
+                        bundle_index == 0
                         and batch_index == 0
                         and not self._checked_post_backward_gradients
                     ):
@@ -580,13 +744,14 @@ class CellGuidedGraphTrainer:
                 best_valid_auc, best_valid_aupr = macro_auc, macro_aupr
                 patience_count = 0
                 self.args.ckpt_name = checkpoint_path
-                checkpoint = {"model": self.model.state_dict()}
-                if self.args.scfm_mode != "precomputed":
-                    checkpoint["scfm_encoder"] = self.scfm_encoder.state_dict()
                 torch.save(
-                    checkpoint
-                    if self.args.scfm_mode != "precomputed"
-                    else checkpoint["model"],
+                    self._checkpoint_payload(
+                        epoch,
+                        optimizer,
+                        best_score,
+                        best_valid_auc,
+                        best_valid_aupr,
+                    ),
                     checkpoint_path,
                 )
                 save_args(self.args, self.args.ckpt_dir)
@@ -618,11 +783,14 @@ class CellGuidedGraphTrainer:
 
         if saved_checkpoint:
             checkpoint = torch.load(checkpoint_path, map_location=self.device)
-            if self.args.scfm_mode == "precomputed":
-                self.model.load_state_dict(checkpoint)
-            else:
+            if isinstance(checkpoint, dict) and "model" in checkpoint:
                 self.model.load_state_dict(checkpoint["model"])
-                self.scfm_encoder.load_state_dict(checkpoint["scfm_encoder"])
+                if self.args.scfm_mode != "precomputed":
+                    self.scfm_encoder.load_state_dict(
+                        checkpoint["scfm_encoder"]
+                    )
+            else:
+                self.model.load_state_dict(checkpoint)
         test_metrics, test_auc, test_aupr = self.evaluate_all(bundles, "test")
         for cell_type, metric in test_metrics.items():
             logger.info("Final test[%s] AUROC=%.4f AUPRC=%.4f", cell_type, metric["auroc"], metric["auprc"])

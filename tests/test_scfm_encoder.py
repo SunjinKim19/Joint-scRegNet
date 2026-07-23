@@ -18,6 +18,10 @@ def make_args(**overrides):
     values = {
         "scfm_mode": "precomputed",
         "scfm_model_path": None,
+        "scfm_model_repo": None,
+        "scfm_model_subfolder": None,
+        "hf_cache_dir": None,
+        "scfm_model_version": "V1",
         "scfm_tokenized_path": None,
         "scfm_output_layer": "last_hidden",
         "scfm_pooling": "gene",
@@ -28,6 +32,11 @@ def make_args(**overrides):
         "lora_target_modules": "query,value",
         "cache_online_scfm_outputs": False,
         "max_scfm_cells": 0,
+        "scfm_cell_batch_size": 8,
+        "scfm_cell_sampling": "all",
+        "scfm_seed": 0,
+        "gradient_checkpointing": False,
+        "lora_r": None,
     }
     values.update(overrides)
     return Namespace(**values)
@@ -60,7 +69,7 @@ class FakeScFM(nn.Module):
 
 class FakeAutoModel:
     @staticmethod
-    def from_pretrained(_):
+    def from_pretrained(_, **__):
         return FakeScFM()
 
 
@@ -88,7 +97,7 @@ class ScFMEncoderTest(unittest.TestCase):
                 ScFMEncoder(
                     make_args(
                         scfm_mode="online_topk",
-                        scfm_model_path="fake-model",
+                        scfm_model_path=directory,
                         scfm_tokenized_path=tokenized_path,
                         train_scfm_top_layers=1,
                     ),
@@ -110,7 +119,7 @@ class ScFMEncoderTest(unittest.TestCase):
             fake_transformers.AutoModel = FakeAutoModel
             args = make_args(
                 scfm_mode="online_topk",
-                scfm_model_path="fake-local-model",
+                scfm_model_path=directory,
                 scfm_tokenized_path=tokenized_path,
                 train_scfm_top_layers=1,
             )
