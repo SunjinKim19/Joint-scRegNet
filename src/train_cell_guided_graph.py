@@ -135,6 +135,35 @@ def _nonzero_gradient_count(parameters):
     )
 
 
+def _gradient_diagnostics(parameters):
+    parameters = list(parameters)
+    none_count = sum(parameter.grad is None for parameter in parameters)
+    zero_count = 0
+    nonzero_count = 0
+    finite = True
+    absolute_sum = 0.0
+    for parameter in parameters:
+        if parameter.grad is None:
+            continue
+        parameter_finite = bool(torch.isfinite(parameter.grad).all())
+        finite = finite and parameter_finite
+        if not parameter_finite:
+            continue
+        value = parameter.grad.detach().abs().sum().item()
+        absolute_sum += value
+        if value > 0:
+            nonzero_count += 1
+        else:
+            zero_count += 1
+    return {
+        "none_count": none_count,
+        "zero_count": zero_count,
+        "nonzero_count": nonzero_count,
+        "finite": finite,
+        "absolute_sum": absolute_sum,
+    }
+
+
 def check_trainable_gradients_after_backward(model, args, scfm_encoder=None):
     """Verify the normal training backward reached the intended parameters."""
     downstream_parameters = [
@@ -179,11 +208,6 @@ def check_trainable_gradients_after_backward(model, args, scfm_encoder=None):
         raise RuntimeError(
             f"scfm_mode={args.scfm_mode} created zero trainable scFM parameters"
         )
-    if not _has_nonzero_finite_gradient(scfm_trainable):
-        raise RuntimeError(
-            f"True fine-tuning check failed: no non-zero gradient reached "
-            f"{args.scfm_mode} scFM parameters. Ensure scFM outputs are not detached."
-        )
     adapter_parameters = [
         parameter
         for parameter in model.cell_m.scfm_adapter.parameters()
@@ -191,6 +215,74 @@ def check_trainable_gradients_after_backward(model, args, scfm_encoder=None):
     ]
     if adapter_parameters and not _has_nonzero_finite_gradient(adapter_parameters):
         raise RuntimeError("No non-zero gradient reached the Cell-M adapter")
+    if args.scfm_mode == "online_lora":
+        raw_hiddens = scfm_encoder._debug_backbone_hiddens
+        raw_none_count = sum(hidden.grad is None for hidden in raw_hiddens)
+        raw_finite = bool(raw_hiddens) and all(
+            hidden.grad is not None and torch.isfinite(hidden.grad).all()
+            for hidden in raw_hiddens
+        )
+        raw_absolute_sum = sum(
+            hidden.grad.detach().abs().sum().item()
+            for hidden in raw_hiddens
+            if hidden.grad is not None and torch.isfinite(hidden.grad).all()
+        )
+        lora_parameters = [
+            parameter
+            for _, parameter in scfm_encoder.lora_named_parameters(
+                trainable_only=True
+            )
+        ]
+        lora_diagnostics = _gradient_diagnostics(lora_parameters)
+        fallback_diagnostics = _gradient_diagnostics(
+            scfm_encoder.fallback_parameters()
+        )
+        cell_m_diagnostics = _gradient_diagnostics(adapter_parameters)
+        downstream_diagnostics = _gradient_diagnostics(downstream_parameters)
+        logger.info(
+            "online_lora gradient diagnostics | raw_hidden_grad_none=%d "
+            "raw_hidden_grad_finite=%s raw_hidden_grad_abs_sum=%.12g | "
+            "LoRA_grad_none=%d LoRA_grad_zero=%d LoRA_grad_nonzero=%d "
+            "LoRA_grad_finite=%s LoRA_grad_abs_sum=%.12g | "
+            "fallback_grad_abs_sum=%.12g Cell-M_grad_abs_sum=%.12g "
+            "downstream_grad_abs_sum=%.12g",
+            raw_none_count,
+            raw_finite,
+            raw_absolute_sum,
+            lora_diagnostics["none_count"],
+            lora_diagnostics["zero_count"],
+            lora_diagnostics["nonzero_count"],
+            lora_diagnostics["finite"],
+            lora_diagnostics["absolute_sum"],
+            fallback_diagnostics["absolute_sum"],
+            cell_m_diagnostics["absolute_sum"],
+            downstream_diagnostics["absolute_sum"],
+        )
+        if not raw_hiddens or raw_none_count:
+            raise RuntimeError(
+                "True fine-tuning check failed (case A): raw Geneformer hidden "
+                "gradient is None; the downstream graph is disconnected before pooling"
+            )
+        if not raw_finite or raw_absolute_sum <= 0:
+            raise RuntimeError(
+                "True fine-tuning check failed: raw Geneformer hidden gradient "
+                "is non-finite or exactly zero"
+            )
+        if (
+            not lora_diagnostics["finite"]
+            or lora_diagnostics["nonzero_count"] == 0
+        ):
+            raise RuntimeError(
+                "True fine-tuning check failed (case B): raw hidden has a "
+                "finite non-zero gradient but no finite non-zero LoRA gradient; "
+                "the PEFT adapter is inactive or bypassed"
+            )
+        scfm_encoder.finish_gradient_debug()
+    elif not _has_nonzero_finite_gradient(scfm_trainable):
+        raise RuntimeError(
+            f"True fine-tuning check failed: no non-zero gradient reached "
+            f"{args.scfm_mode} scFM parameters. Ensure scFM outputs are not detached."
+        )
     logger.info(
         "Post-backward gradient check passed: scfm_mode=%s, "
         "scFM_backbone_loaded=True, scFM_trainable_parameter_count=%d, "
@@ -350,7 +442,38 @@ class CellGuidedGraphTrainer:
                 "Optimizer parameter coverage mismatch: "
                 f"missing={len(missing)} extra={len(extra)}"
             )
-        return getattr(optim, self.args.optimizer_name)(parameter_groups)
+        optimizer = getattr(optim, self.args.optimizer_name)(parameter_groups)
+        if self.args.scfm_mode == "online_lora":
+            encoder_lora_ids = {
+                id(parameter)
+                for _, parameter in self.scfm_encoder.lora_named_parameters(
+                    trainable_only=True
+                )
+            }
+            forward_lora_ids = (
+                self.scfm_encoder.lora_parameter_ids_from_forward_model()
+            )
+            optimizer_parameter_ids = {
+                id(parameter)
+                for group in optimizer.param_groups
+                for parameter in group["params"]
+            }
+            missing = encoder_lora_ids - optimizer_parameter_ids
+            if not encoder_lora_ids:
+                raise RuntimeError("online_lora has no trainable LoRA parameters")
+            if encoder_lora_ids != forward_lora_ids:
+                raise RuntimeError(
+                    "Encoder and actual forward PeftModel use different LoRA objects"
+                )
+            if missing:
+                raise RuntimeError(
+                    f"Optimizer is missing {len(missing)} LoRA parameter objects"
+                )
+            logger.info(
+                "LoRA optimizer identity check passed: %d parameter objects",
+                len(encoder_lora_ids),
+            )
+        return optimizer
 
     @staticmethod
     def _limit_bundle_edges(bundle, args):

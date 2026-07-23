@@ -39,10 +39,10 @@ class GeneRepresentationPooler(nn.Module):
         valid = valid & gene_index_map.lt(self.num_genes)
         flat_indices = gene_index_map[valid].long()
         flat_hidden = hidden[valid]
-        gene_sum = hidden.new_zeros((self.num_genes, self.hidden_dim))
-        gene_count = hidden.new_zeros((self.num_genes, 1))
-        gene_sum.index_add_(0, flat_indices, flat_hidden)
-        gene_count.index_add_(
+        gene_sum = hidden.new_zeros((self.num_genes, self.hidden_dim)).index_add(
+            0, flat_indices, flat_hidden
+        )
+        gene_count = hidden.new_zeros((self.num_genes, 1)).index_add(
             0,
             flat_indices,
             torch.ones(
@@ -91,6 +91,11 @@ class ScFMEncoder(nn.Module):
         self.assets = None
         self.artifact_fingerprint = None
         self.artifact_metadata = {}
+        self._debug_last_backbone_hidden = None
+        self._debug_backbone_hiddens = []
+        self._debug_gradient_check_completed = False
+        self._forward_model_id = None
+        self._lora_parameter_ids_after_wrap = set()
 
         if self.mode == "precomputed":
             logger.info(
@@ -407,8 +412,25 @@ class ScFMEncoder(nn.Module):
             bias="none",
         )
         self.model = get_peft_model(self.model, config)
-        if not any(parameter.requires_grad for parameter in self.model.parameters()):
+        try:
+            from peft import PeftModel
+        except ImportError as exc:  # pragma: no cover - imported above
+            raise RuntimeError("PEFT became unavailable while enabling LoRA") from exc
+        if not isinstance(self.model, PeftModel):
+            raise RuntimeError(
+                "get_peft_model did not return a PeftModel; refusing online_lora"
+            )
+        lora_parameters = self.lora_named_parameters(trainable_only=False)
+        if not lora_parameters:
+            raise RuntimeError("PEFT created zero parameters whose name contains 'lora_'")
+        if not any(parameter.requires_grad for _, parameter in lora_parameters):
             raise RuntimeError("PEFT created zero trainable LoRA parameters")
+        self._forward_model_id = id(self.model)
+        self._lora_parameter_ids_after_wrap = {
+            id(parameter)
+            for _, parameter in lora_parameters
+            if parameter.requires_grad
+        }
         logger.info(
             "LoRA enabled: rank=%d alpha=%d dropout=%.4f targets=%s",
             self.args.lora_r
@@ -501,6 +523,34 @@ class ScFMEncoder(nn.Module):
             for parameter in self.model.parameters()
             if parameter.requires_grad
         ]
+
+    def lora_named_parameters(self, trainable_only=True):
+        if self.model is None:
+            return []
+        return [
+            (name, parameter)
+            for name, parameter in self.model.named_parameters()
+            if "lora_" in name
+            and (parameter.requires_grad or not trainable_only)
+        ]
+
+    def lora_parameter_ids_from_forward_model(self):
+        if self.mode != "online_lora":
+            return set()
+        if id(self.model) != self._forward_model_id:
+            raise RuntimeError(
+                "The PeftModel instance changed after LoRA setup; optimizer and "
+                "forward would reference different parameter objects"
+            )
+        current = {
+            id(parameter)
+            for _, parameter in self.lora_named_parameters(trainable_only=True)
+        }
+        if current != self._lora_parameter_ids_after_wrap:
+            raise RuntimeError(
+                "Trainable LoRA parameter objects changed after PEFT setup"
+            )
+        return current
 
     def fallback_parameters(self):
         if self.gene_pooler is None:
@@ -635,7 +685,11 @@ class ScFMEncoder(nn.Module):
             value = self.tokenized_data.get(key)
             if value is not None:
                 model_inputs[key] = value.index_select(0, cell_indices).to(self.device)
+        if self.mode == "online_lora":
+            self.lora_parameter_ids_from_forward_model()
         try:
+            # In online_lora self.model is the PeftModel itself. Do not call
+            # base_model/get_base_model/model.bert here: that would bypass PEFT.
             outputs = self.model(
                 **model_inputs, output_hidden_states=True, return_dict=True
             )
@@ -644,7 +698,16 @@ class ScFMEncoder(nn.Module):
                 "scFM forward ran out of GPU memory. Reduce --max_scfm_cells or "
                 "--scfm_cell_batch_size, and prefer online_lora over online_topk."
             ) from exc
-        return self._extract_hidden_state(outputs)
+        hidden = self._extract_hidden_state(outputs)
+        if (
+            self.training
+            and self.mode == "online_lora"
+            and not self._debug_gradient_check_completed
+        ):
+            hidden.retain_grad()
+            self._debug_last_backbone_hidden = hidden
+            self._debug_backbone_hiddens.append(hidden)
+        return hidden
 
     def _pool_selected_cells(self, num_genes):
         if num_genes != self.num_original_genes:
@@ -667,8 +730,24 @@ class ScFMEncoder(nn.Module):
             total_count = (
                 batch_count if total_count is None else total_count + batch_count
             )
-        output = self.gene_pooler.finalize(total_sum, total_count)
+        pooled = total_sum / total_count.clamp_min(1)
         observed = total_count.squeeze(-1).gt(0)
+        fallback = self.gene_pooler.fallback_gene_embeddings.weight
+        output = torch.where(observed.unsqueeze(-1), pooled, fallback)
+        if observed.any() and not torch.equal(output[observed], pooled[observed]):
+            raise RuntimeError(
+                "Fallback embeddings unexpectedly replaced observed pooled genes"
+            )
+        if (~observed).any() and not torch.equal(output[~observed], fallback[~observed]):
+            raise RuntimeError(
+                "Fallback branch did not supply exactly the unobserved genes"
+            )
+        if not observed.any():
+            raise RuntimeError(
+                "Geneformer pooling observed zero genes; every downstream row "
+                "would use fallback embeddings and no BCE gradient could reach "
+                "LoRA. Inspect attention_mask and gene_index_map in the token artifact."
+            )
         tokenizable = self.tokenized_data.get("tokenizable_gene_mask")
         tokenizable_count = (
             int(tokenizable.sum())
@@ -677,14 +756,29 @@ class ScFMEncoder(nn.Module):
         )
         self.last_diagnostics = {
             "pooled_gene_count": int(observed.sum()),
+            "observed_pooled_genes": int(observed.sum()),
             "fallback_gene_count": int((~observed).sum()),
+            "fallback_genes": int((~observed).sum()),
             "tokenizable_gene_count": tokenizable_count,
             "selected_cell_count": int(self.selected_cell_indices.numel()),
             "minimum_observation_count": float(total_count.min()),
             "maximum_observation_count": float(total_count.max()),
             "output_shape": tuple(output.shape),
+            "pooled_branch_requires_grad": pooled.requires_grad,
+            "fallback_branch_requires_grad": fallback.requires_grad,
+            "final_output_requires_grad": output.requires_grad,
         }
         logger.info("Gene pooling diagnostics: %s", self.last_diagnostics)
+        logger.info(
+            "Gene pooling gradient branches | observed_pooled_genes=%d "
+            "fallback_genes=%d pooled_branch_requires_grad=%s "
+            "fallback_branch_requires_grad=%s final_output_requires_grad=%s",
+            self.last_diagnostics["observed_pooled_genes"],
+            self.last_diagnostics["fallback_genes"],
+            pooled.requires_grad,
+            fallback.requires_grad,
+            output.requires_grad,
+        )
         return output
 
     def forward(self, context):
@@ -702,6 +796,13 @@ class ScFMEncoder(nn.Module):
 
         if self._cached_gene_embeddings is not None:
             return self._cached_gene_embeddings
+        if (
+            self.training
+            and self.mode == "online_lora"
+            and not self._debug_gradient_check_completed
+        ):
+            self._debug_last_backbone_hidden = None
+            self._debug_backbone_hiddens = []
         num_genes = context.get("num_genes") if isinstance(context, dict) else None
         if not isinstance(num_genes, int) or num_genes <= 0:
             raise ValueError("Online scFM forward requires integer context['num_genes']")
@@ -710,3 +811,6 @@ class ScFMEncoder(nn.Module):
             # Only online_frozen reaches this branch; no trainable graph is detached.
             self._cached_gene_embeddings = gene_embeddings.detach()
         return gene_embeddings
+
+    def finish_gradient_debug(self):
+        self._debug_gradient_check_completed = True
