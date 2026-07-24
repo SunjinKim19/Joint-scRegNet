@@ -3,6 +3,7 @@ set -euo pipefail
 
 ARTIFACT="${ARTIFACT:-./artifacts/hESC_500_geneformer_v1_tokens.pt}"
 OUTPUT_DIR="${OUTPUT_DIR:-./out/hesc_geneformer_v1_lora_r8}"
+SCFM_GENE_POOLING="${SCFM_GENE_POOLING:-mean}"
 
 if [[ ! -f "$ARTIFACT" ]]; then
   echo "Missing token artifact: $ARTIFACT" >&2
@@ -23,6 +24,7 @@ python src/train_cell_guided_graph.py \
   --scfm_model_subfolder Geneformer-V1-10M \
   --scfm_model_version V1 \
   --scfm_tokenized_path "$ARTIFACT" \
+  --scfm_gene_pooling "${SCFM_GENE_POOLING}" \
   --lora_r 8 \
   --lora_alpha 16 \
   --lora_dropout 0.05 \

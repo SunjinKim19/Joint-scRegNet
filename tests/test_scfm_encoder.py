@@ -25,6 +25,7 @@ def make_args(**overrides):
         "scfm_tokenized_path": None,
         "scfm_output_layer": "last_hidden",
         "scfm_pooling": "gene",
+        "scfm_gene_pooling": "mean",
         "train_scfm_top_layers": 0,
         "lora_rank": 8,
         "lora_alpha": 16,

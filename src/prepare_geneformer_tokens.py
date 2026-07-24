@@ -65,6 +65,21 @@ def validate_token_artifact(artifact):
         raise ValueError("gene_index_map shape must match input_ids")
     if not torch.equal(mapping[attention == 0], torch.full_like(mapping[attention == 0], -1)):
         raise ValueError("Padding positions in gene_index_map must be -1")
+    expression_values = artifact.get("token_expression_values")
+    if expression_values is not None:
+        if not torch.is_floating_point(expression_values):
+            raise ValueError("token_expression_values must be floating point")
+        if expression_values.shape != input_ids.shape:
+            raise ValueError(
+                "token_expression_values shape must match input_ids"
+            )
+        if not torch.equal(
+            expression_values[attention == 0],
+            torch.zeros_like(expression_values[attention == 0]),
+        ):
+            raise ValueError(
+                "Padding positions in token_expression_values must be zero"
+            )
     num_genes = len(artifact["gene_symbols"])
     valid = mapping[attention.bool()]
     if valid.numel() and (valid.min() < 0 or valid.max() >= num_genes):
@@ -73,6 +88,11 @@ def validate_token_artifact(artifact):
         "input_ids_shape": tuple(input_ids.shape),
         "attention_mask_shape": tuple(attention.shape),
         "gene_index_map_shape": tuple(mapping.shape),
+        "token_expression_values_shape": (
+            tuple(expression_values.shape)
+            if expression_values is not None
+            else None
+        ),
         "original_gene_count": num_genes,
         "cell_count": input_ids.size(0),
         "padding_consistent": True,
@@ -143,10 +163,12 @@ def prepare_geneformer_tokens(
         raise ValueError("Valid Ensembl IDs contain duplicates")
 
     expression = expression_df.iloc[:, 1:].to_numpy(dtype=np.float64)
-    if not np.isfinite(expression).all():
-        raise ValueError("Expression matrix contains NaN or Inf")
-    if (expression < 0).any():
-        raise ValueError("Expression matrix contains negative values")
+    non_finite_expression_count = int((~np.isfinite(expression)).sum())
+    negative_expression_count = int((expression < 0).sum())
+    expression = np.nan_to_num(
+        expression, nan=0.0, posinf=0.0, neginf=0.0
+    )
+    expression = np.clip(expression, a_min=0.0, a_max=None)
     token_dictionary = load_token_dictionary(token_dictionary_path)
     gene_token_ids = torch.full((len(gene_symbols),), -1, dtype=torch.long)
     for index, ensembl_id in enumerate(ensembl_ids):
@@ -157,6 +179,7 @@ def prepare_geneformer_tokens(
 
     ranked_token_rows = []
     ranked_gene_rows = []
+    ranked_expression_rows = []
     detected_lengths = []
     for cell_index in range(expression.shape[1]):
         values = expression[tokenizable_indices, cell_index]
@@ -172,6 +195,11 @@ def prepare_geneformer_tokens(
             )
         ranked_gene_rows.append(torch.as_tensor(ranked_indices, dtype=torch.long))
         ranked_token_rows.append(gene_token_ids[ranked_indices])
+        ranked_expression_rows.append(
+            torch.as_tensor(
+                expression[ranked_indices, cell_index], dtype=torch.float32
+            )
+        )
         detected_lengths.append(len(ranked_indices))
 
     saved_length = min(max(detected_lengths), maximum)
@@ -181,13 +209,17 @@ def prepare_geneformer_tokens(
     )
     attention_mask = torch.zeros((cell_count, saved_length), dtype=torch.long)
     gene_index_map = torch.full((cell_count, saved_length), -1, dtype=torch.long)
-    for cell_index, (tokens, indices) in enumerate(
-        zip(ranked_token_rows, ranked_gene_rows)
+    token_expression_values = torch.zeros(
+        (cell_count, saved_length), dtype=torch.float32
+    )
+    for cell_index, (tokens, indices, expression_row) in enumerate(
+        zip(ranked_token_rows, ranked_gene_rows, ranked_expression_rows)
     ):
         length = min(tokens.numel(), saved_length)
         input_ids[cell_index, :length] = tokens[:length]
         attention_mask[cell_index, :length] = 1
         gene_index_map[cell_index, :length] = indices[:length]
+        token_expression_values[cell_index, :length] = expression_row[:length]
 
     removed = [
         {
@@ -220,6 +252,8 @@ def prepare_geneformer_tokens(
         "saved_sequence_length": saved_length,
         "pad_token_id": int(padding_id),
         "special_tokens_added": False,
+        "non_finite_expression_values_replaced_with_zero": non_finite_expression_count,
+        "negative_expression_values_clamped_to_zero": negative_expression_count,
         "removed_genes": removed,
         "expression_sha256": sha256_file(expression_path),
         "mapping_sha256": sha256_file(mapping_path),
@@ -236,6 +270,7 @@ def prepare_geneformer_tokens(
         "input_ids": input_ids,
         "attention_mask": attention_mask,
         "gene_index_map": gene_index_map,
+        "token_expression_values": token_expression_values,
         "cell_ids": [str(value) for value in expression_df.columns[1:]],
         "gene_symbols": gene_symbols,
         "ensembl_ids": ensembl_ids,

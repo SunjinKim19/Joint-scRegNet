@@ -735,9 +735,11 @@ class CellGuidedGraphTrainer:
             if parameter.requires_grad
         )
         logger.info(
-            "scfm_mode=%s backbone_loaded=%s trainable_scfm_params=%d/%d "
+            "scfm_mode=%s scfm_gene_pooling=%s backbone_loaded=%s "
+            "trainable_scfm_params=%d/%d "
             "trainable_downstream_params=%d",
             self.args.scfm_mode,
+            getattr(self.args, "scfm_gene_pooling", "mean"),
             self.scfm_encoder.backbone_loaded,
             trainable_scfm,
             total_scfm,

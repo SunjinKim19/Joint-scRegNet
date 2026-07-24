@@ -32,6 +32,7 @@ def make_lora_args(model_path, tokenized_path):
         scfm_tokenized_path=tokenized_path,
         scfm_output_layer="last_hidden",
         scfm_pooling="gene",
+        scfm_gene_pooling="expression_weighted",
         train_scfm_top_layers=0,
         lora_rank=4,
         lora_r=None,
@@ -52,7 +53,7 @@ def make_lora_args(model_path, tokenized_path):
     "actual tiny-model LoRA test requires transformers and peft",
 )
 class ScFMEncoderLoraTest(unittest.TestCase):
-    def test_actual_peft_forward_pooling_and_backward(self):
+    def test_actual_peft_expression_weighted_pooling_and_backward(self):
         from peft import PeftModel
         from transformers import BertConfig, BertModel
 
@@ -80,6 +81,9 @@ class ScFMEncoderLoraTest(unittest.TestCase):
                     "gene_index_map": torch.tensor(
                         [[0, 1, 2, 3], [0, 1, 2, -1]], dtype=torch.long
                     ),
+                    "token_expression_values": torch.tensor(
+                        [[4.0, 3.0, 2.0, 1.0], [2.0, 3.0, 1.0, 0.0]]
+                    ),
                     "metadata": {"original_gene_count": 5},
                 },
                 tokenized_path,
@@ -98,6 +102,22 @@ class ScFMEncoderLoraTest(unittest.TestCase):
             self.assertEqual(gene_embeddings.shape, (5, 16))
             self.assertEqual(encoder.last_diagnostics["pooled_gene_count"], 4)
             self.assertEqual(encoder.last_diagnostics["fallback_gene_count"], 1)
+            self.assertEqual(
+                encoder.last_diagnostics["gene_pooling_mode"],
+                "expression_weighted",
+            )
+            self.assertEqual(
+                encoder.last_diagnostics["weighted_pooled_gene_count"], 4
+            )
+            self.assertEqual(
+                encoder.last_diagnostics["zero_weight_gene_count"], 1
+            )
+            self.assertTrue(
+                encoder.last_diagnostics["pooled_branch_requires_grad"]
+            )
+            self.assertTrue(
+                encoder.last_diagnostics["final_output_requires_grad"]
+            )
 
             downstream = CellGuidedGraphScRegNet(
                 num_genes=5,

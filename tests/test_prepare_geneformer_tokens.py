@@ -63,9 +63,25 @@ class PrepareGeneformerTokensTest(unittest.TestCase):
         self.assertEqual(artifact["input_ids"][0, :2].tolist(), [11, 12])
         self.assertEqual(artifact["gene_index_map"][0, :2].tolist(), [0, 1])
         self.assertEqual(artifact["gene_index_map"][1, :2].tolist(), [1, 0])
+        self.assertEqual(
+            artifact["token_expression_values"][0, :2].tolist(),
+            [5.0, 5.0],
+        )
+        self.assertEqual(
+            artifact["token_expression_values"][1, :2].tolist(),
+            [3.0, 1.0],
+        )
         self.assertFalse(artifact["tokenizable_gene_mask"][2])
         self.assertFalse(artifact["tokenizable_gene_mask"][3])
         self.assertTrue((artifact["gene_index_map"][artifact["attention_mask"] == 0] == -1).all())
+        self.assertTrue(
+            (
+                artifact["token_expression_values"][
+                    artifact["attention_mask"] == 0
+                ]
+                == 0
+            ).all()
+        )
         self.assertFalse(artifact["metadata"]["special_tokens_added"])
         loaded = torch.load(self.output_path, weights_only=False)
         self.assertTrue(torch.equal(loaded["input_ids"], artifact["input_ids"]))

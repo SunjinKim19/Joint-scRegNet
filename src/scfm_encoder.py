@@ -53,6 +53,38 @@ class GeneRepresentationPooler(nn.Module):
         )
         return gene_sum, gene_count
 
+    def accumulate_expression_weighted(
+        self, hidden, attention_mask, gene_index_map, expression_weights
+    ):
+        if expression_weights.shape != hidden.shape[:2]:
+            raise ValueError(
+                "expression_weights shape must match hidden [B, L]"
+            )
+        if attention_mask.shape != hidden.shape[:2]:
+            raise ValueError("attention_mask shape must match hidden [B, L]")
+        if gene_index_map.shape != hidden.shape[:2]:
+            raise ValueError("gene_index_map shape must match hidden [B, L]")
+        weights = torch.nan_to_num(
+            expression_weights.detach().to(
+                device=hidden.device, dtype=hidden.dtype
+            ),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp_min(0)
+        valid = attention_mask.bool() & gene_index_map.ge(0)
+        valid = valid & gene_index_map.lt(self.num_genes)
+        flat_indices = gene_index_map[valid].long()
+        flat_weights = weights[valid].unsqueeze(-1)
+        flat_hidden = hidden[valid]
+        weighted_sum = hidden.new_zeros(
+            (self.num_genes, self.hidden_dim)
+        ).index_add(0, flat_indices, flat_hidden * flat_weights)
+        weight_sum = hidden.new_zeros((self.num_genes, 1)).index_add(
+            0, flat_indices, flat_weights
+        )
+        return weighted_sum, weight_sum
+
     def finalize(self, gene_sum, gene_count):
         pooled = gene_sum / gene_count.clamp_min(1)
         observed = gene_count.squeeze(-1).gt(0)
@@ -80,6 +112,11 @@ class ScFMEncoder(nn.Module):
         super().__init__()
         self.args = args
         self.mode = args.scfm_mode
+        self.gene_pooling_mode = getattr(args, "scfm_gene_pooling", "mean")
+        if self.gene_pooling_mode not in ("mean", "expression_weighted"):
+            raise ValueError(
+                "--scfm_gene_pooling must be mean or expression_weighted"
+            )
         self.device = device
         self.model = None
         self.tokenized_data = None
@@ -238,6 +275,7 @@ class ScFMEncoder(nn.Module):
                 *ScFMEncoder.MODEL_INPUT_KEYS,
                 *ScFMEncoder.GENE_MAPPING_KEYS,
                 "target_gene_ids",
+                "token_expression_values",
             ):
                 try:
                     normalized[key] = ScFMEncoder._to_tensor_with_padding(
@@ -677,7 +715,30 @@ class ScFMEncoder(nn.Module):
         else:
             attention_mask = attention_mask.index_select(0, cell_indices)
         attention_mask = attention_mask.to(hidden.device)
-        return self.gene_pooler.accumulate(hidden, attention_mask, mapping)
+        if self.gene_pooling_mode == "mean":
+            # Preserve the original mean-pooling calculation path exactly.
+            return self.gene_pooler.accumulate(
+                hidden, attention_mask, mapping
+            )
+        expression_values = self.tokenized_data.get(
+            "token_expression_values"
+        )
+        if expression_values is None:
+            raise ValueError(
+                "--scfm_gene_pooling expression_weighted requires "
+                "'token_expression_values' aligned with gene_index_map in the "
+                "token artifact. Regenerate it with "
+                "src/prepare_geneformer_tokens.py --overwrite."
+            )
+        expression_values = expression_values.index_select(
+            0, cell_indices
+        )
+        return self.gene_pooler.accumulate_expression_weighted(
+            hidden,
+            attention_mask,
+            mapping,
+            expression_values,
+        )
 
     def _model_forward_for_cells(self, cell_indices):
         model_inputs = {}
@@ -730,7 +791,11 @@ class ScFMEncoder(nn.Module):
             total_count = (
                 batch_count if total_count is None else total_count + batch_count
             )
-        pooled = total_sum / total_count.clamp_min(1)
+        if self.gene_pooling_mode == "mean":
+            # Preserve the original denominator and observed-mask calculation.
+            pooled = total_sum / total_count.clamp_min(1)
+        else:
+            pooled = total_sum / total_count.clamp_min(1e-8)
         observed = total_count.squeeze(-1).gt(0)
         fallback = self.gene_pooler.fallback_gene_embeddings.weight
         output = torch.where(observed.unsqueeze(-1), pooled, fallback)
@@ -754,11 +819,28 @@ class ScFMEncoder(nn.Module):
             if isinstance(tokenizable, torch.Tensor)
             else int(observed.sum())
         )
+        positive_weight_sums = total_count[total_count.gt(0)]
+        weighted_mode = self.gene_pooling_mode == "expression_weighted"
         self.last_diagnostics = {
+            "gene_pooling_mode": self.gene_pooling_mode,
             "pooled_gene_count": int(observed.sum()),
             "observed_pooled_genes": int(observed.sum()),
             "fallback_gene_count": int((~observed).sum()),
             "fallback_genes": int((~observed).sum()),
+            "weighted_pooled_gene_count": (
+                int(observed.sum()) if weighted_mode else 0
+            ),
+            "zero_weight_gene_count": (
+                int((~observed).sum()) if weighted_mode else 0
+            ),
+            "minimum_positive_weight_sum": (
+                float(positive_weight_sums.min())
+                if weighted_mode and positive_weight_sums.numel()
+                else None
+            ),
+            "maximum_weight_sum": (
+                float(total_count.max()) if weighted_mode else None
+            ),
             "tokenizable_gene_count": tokenizable_count,
             "selected_cell_count": int(self.selected_cell_indices.numel()),
             "minimum_observation_count": float(total_count.min()),
@@ -770,9 +852,11 @@ class ScFMEncoder(nn.Module):
         }
         logger.info("Gene pooling diagnostics: %s", self.last_diagnostics)
         logger.info(
-            "Gene pooling gradient branches | observed_pooled_genes=%d "
+            "Gene pooling gradient branches | gene_pooling_mode=%s "
+            "observed_pooled_genes=%d "
             "fallback_genes=%d pooled_branch_requires_grad=%s "
             "fallback_branch_requires_grad=%s final_output_requires_grad=%s",
+            self.gene_pooling_mode,
             self.last_diagnostics["observed_pooled_genes"],
             self.last_diagnostics["fallback_genes"],
             pooled.requires_grad,

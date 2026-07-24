@@ -72,20 +72,23 @@ non-zero trainable backbone gradients. No helper invokes backward.
 
 ## 10. Unit and integration tests
 
-`python -m unittest discover -s tests -v`: **PASS (21 tests at the time of this
+`python -m unittest discover -s tests -v`: **PASS (24 tests at the time of this
 report)**. Tests cover assets, deterministic rank tokenization, scatter pooling,
-fallback gradients, fixed/edge graph paths, and a synthetic online top-layer
-backbone-to-link-loss gradient.
+fallback gradients, fixed/edge graph paths, a synthetic online top-layer
+backbone-to-link-loss gradient, and an actual tiny `BertModel` +
+`PeftModelForFeatureExtraction` LoRA backward path. Mean pooling retains its
+original sum/count formula; expression-weighted pooling is also covered at
+`[910, 256]` shape and through LoRA backward.
 
 `pytest` is not installed in the current environment, so the equivalent
 standard-library unittest suite was used.
 
 ## 11. Actual V1 smoke result
 
-**SKIPPED/BLOCKED.** The current environment has no `transformers`, `peft`,
-`huggingface_hub`, local Geneformer checkpoint, or local token dictionary.
-Running the smoke script correctly stops with the actionable missing
-`huggingface_hub`/token-dictionary error. Actual V1 LoRA success is not claimed.
+**SKIPPED/BLOCKED.** The current environment has the optional Python
+dependencies and the actual tiny-model LoRA backward test passes, but it has no
+local Geneformer V1 checkpoint, token dictionary, or real hESC token artifact.
+Actual V1 LoRA success is not claimed until the target server smoke is rerun.
 
 ## 12. Precomputed regression
 

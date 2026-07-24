@@ -244,6 +244,15 @@ def parse_args():
         default="gene",
         choices=["gene", "cell", "mean"],
     )
+    parser.add_argument(
+        "--scfm_gene_pooling",
+        choices=["mean", "expression_weighted"],
+        default="mean",
+        help=(
+            "Aggregate token hidden states for each gene by observation mean "
+            "or by aligned non-negative expression weights."
+        ),
+    )
     parser.add_argument("--lora_rank", type=int, default=8)
     parser.add_argument(
         "--lora_r", type=int, default=None, help="Alias overriding --lora_rank."
